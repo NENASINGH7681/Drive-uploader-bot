@@ -1,8 +1,7 @@
-# Python 3.10 Slim version (Lightweight & Fast)
+# Python 3.10 Slim (Stable & Light)
 FROM python:3.10-slim
 
-# System dependencies install karein
-# Note: Removed 'musl-dev' and added 'python3-dev' for better compilation
+# System dependencies install (Fixed for Debian)
 RUN apt-get update && apt-get install -y \
     gcc \
     libffi-dev \
@@ -10,15 +9,15 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Work Directory set karein
+# Working Directory
 WORKDIR /app
 
-# Requirements copy aur install karein
+# Install Requirements
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Baaki code copy karein
+# Copy Code
 COPY . .
 
-# Bot start karein
+# Run Bot
 CMD ["python", "bot.py"]
