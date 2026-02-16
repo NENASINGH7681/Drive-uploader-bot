@@ -6,12 +6,12 @@ import shutil
 import re
 import json
 import subprocess
+import google.auth.transport.requests
 from aiohttp import web
 from pyrogram import Client, filters, idle
 from pyrogram.types import BotCommand
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
 
 # --- CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID"))
@@ -28,12 +28,14 @@ SERVICE_ACCOUNT_FILE = 'credentials.json'
 CONFIG_FILE = "config.json"
 
 # --- INITIALIZE BOT ---
-bot = Client("pro_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+bot = Client("aria2_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # Global Variables
 user_data = {}
 STOP_PROCESS = False
-FOLDER_INDEX = [] 
+FOLDER_INDEX = []
+SKIP_UNTIL_NAME = None # Jaha se start karna hai
+FOUND_START_FILE = False # Flag ki file mili ya nahi
 
 # --- CONFIG MANAGEMENT ---
 def load_config():
@@ -135,36 +137,10 @@ async def count_total_files(service, folder_id):
         if not page_token: break
     return total
 
-# --- CRITICAL FIX: SEARCH LOGIC ---
-async def check_file_in_channel(client, chat_id, file_name):
-    try:
-        # 1. Clean Search: Sirf filename search karenge, koi emoji ya star (*) nahi.
-        # Telegram search exact words match karta hai.
-        query = file_name
-        
-        # 2. Limit 5 messages check karenge (Safety ke liye)
-        async for message in client.search_messages(chat_id, query=query, limit=5):
-            
-            # 3. Double Check: Kya sach me filename caption me hai?
-            if message.caption and file_name in message.caption:
-                return True
-            
-            # 4. Check File Attributes (Agar caption edit ho gya ho to)
-            if message.document and message.document.file_name == file_name:
-                return True
-            if message.video and message.video.file_name == file_name:
-                return True
-                
-    except Exception as e:
-        print(f"Search Error: {e}")
-        return False
-        
-    return False
-
-# --- GOOGLE DRIVE & DOWNLOAD ---
+# --- GOOGLE DRIVE FUNCTIONS ---
 def get_gdrive_service():
     creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-    return build('drive', 'v3', credentials=creds)
+    return build('drive', 'v3', credentials=creds), creds
 
 def get_file_id_from_url(url):
     if "id=" in url: return url.split("id=")[1].split("&")[0]
@@ -172,23 +148,66 @@ def get_file_id_from_url(url):
     elif "/d/" in url: return url.split("/d/")[1].split("/")[0]
     return url
 
-async def download_file_gdrive(service, file_id, original_name, message):
+# --- 🚀 ARIA2C DOWNLOADER (Problem 4 Fixed) ---
+async def download_with_aria2(file_id, original_name, message, creds):
     temp_filename = f"temp_{file_id}" 
     file_path = f"./{temp_filename}"
     
-    request = await asyncio.to_thread(service.files().get_media, fileId=file_id)
-    file_metadata = await asyncio.to_thread(service.files().get(fileId=file_id, fields="size").execute)
-    total_size = int(file_metadata.get('size', 0))
-    start_time = time.time()
+    # 1. Get Access Token for Aria2
+    request = google.auth.transport.requests.Request()
+    creds.refresh(request)
+    token = creds.token
     
-    with open(file_path, "wb") as fh:
-        downloader = MediaIoBaseDownload(fh, request, chunksize=10 * 1024 * 1024)
-        done = False
-        while done is False:
-            if STOP_PROCESS: raise Exception("Stopped by User")
-            status, done = await asyncio.to_thread(downloader.next_chunk)
-            if status:
-                await progress(int(status.resumable_progress), total_size, message, start_time, f"⬇️ **Downloading:**\n`{original_name}`")
+    # 2. Download URL
+    download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+    
+    start_time = time.time()
+    await message.edit(f"⬇️ **Starting Aria2c:**\n`{original_name}`")
+
+    # 3. Run Aria2c command
+    # -x16: 16 Connections (Fast Speed)
+    # -s16: Split file into 16 parts
+    cmd = [
+        "aria2c", 
+        f"--header=Authorization: Bearer {token}",
+        "-x16", "-s16", "-j16", "-k1M",
+        "--out", temp_filename,
+        download_url
+    ]
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    
+    # Monitor Aria2 Progress (Simplified)
+    while process.returncode is None:
+        if STOP_PROCESS:
+            process.terminate()
+            raise Exception("Stopped by User")
+        
+        # Check if file exists and update simple progress
+        if os.path.exists(file_path):
+            current_size = os.path.getsize(file_path)
+            # Total size hume pata nahi hota aria2 stream me easily, 
+            # to bas downloaded size dikhayenge
+            if current_size > 0 and time.time() - start_time > 3:
+                try:
+                    speed = current_size / (time.time() - start_time)
+                    await message.edit(
+                        f"⬇️ **Downloading (Aria2c High Speed):**\n`{original_name}`\n\n"
+                        f"📦 **Downloaded:** {humanbytes(current_size)}\n"
+                        f"🚀 **Avg Speed:** {humanbytes(speed)}/s"
+                    )
+                except: pass
+        
+        await asyncio.sleep(2)
+        if process.returncode is not None: break
+
+    await process.wait()
+    
+    if process.returncode != 0:
+        raise Exception("Aria2c Download Failed")
+
     return file_path
 
 # --- UPLOAD ---
@@ -228,9 +247,9 @@ async def upload_file(client, file_path, display_name, chat_id, caption, message
     finally:
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
 
-# --- RECURSIVE CORE ---
-async def recursive_process(client, service, folder_id, user_id, message, parent_path="", is_root_selection=False):
-    global STOP_PROCESS, FOLDER_INDEX
+# --- RECURSIVE CORE (Problem 3: Start From File Logic) ---
+async def recursive_process(client, service, creds, folder_id, user_id, message, parent_path=""):
+    global STOP_PROCESS, FOLDER_INDEX, SKIP_UNTIL_NAME, FOUND_START_FILE
     if STOP_PROCESS: return
 
     config = load_config()
@@ -250,34 +269,42 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
         file_id = item['id']
         mime_type = item['mimeType']
 
+        # --- SKIPPING LOGIC ---
+        # Agar "Start From" set hai aur abhi tak file nahi mili, to check karo
+        if SKIP_UNTIL_NAME and not FOUND_START_FILE:
+            # Agar ye folder hai, to iske andar jaake dekhna padega
+            if mime_type == 'application/vnd.google-apps.folder':
+                 # Folder ke andar search jari rakho
+                 pass 
+            # Agar ye file hai
+            else:
+                if original_name.strip() == SKIP_UNTIL_NAME.strip():
+                    FOUND_START_FILE = True # Mil gayi! Ab yahan se download shuru
+                    await client.send_message(user_id, f"✅ **Found Start Point:** {original_name}\nResuming Download...")
+                else:
+                    # Match nahi hua, skip karo
+                    continue
+
         if mime_type == 'application/vnd.google-apps.folder':
             full_folder_name = f"📂 {parent_path}{original_name}"
-            sent_msg = await client.send_message(chat_id, f"**{full_folder_name}**")
             
-            # PIN logic: Only if it is Root Selection
-            if is_root_selection:
-                try: await client.pin_chat_message(chat_id, sent_msg.id)
-                except: pass
+            # Agar file mil chuki hai ya hum skip mode me nahi hain, tabhi folder message bhejo
+            if not SKIP_UNTIL_NAME or FOUND_START_FILE:
+                sent_msg = await client.send_message(chat_id, f"**{full_folder_name}**")
+                clean_cid = str(chat_id).replace("-100", "")
+                msg_link = f"https://t.me/c/{clean_cid}/{sent_msg.id}"
+                FOLDER_INDEX.append(f"[{original_name}]({msg_link})")
 
-            clean_cid = str(chat_id).replace("-100", "")
-            msg_link = f"https://t.me/c/{clean_cid}/{sent_msg.id}"
-            FOLDER_INDEX.append(f"[{original_name}]({msg_link})")
-
-            await recursive_process(client, service, file_id, user_id, message, parent_path + original_name + " / ", is_root_selection=False)
+            # Recursion
+            await recursive_process(client, service, creds, file_id, user_id, message, parent_path + original_name + " / ")
         else:
-            # Check Resume
-            await message.edit(f"🔎 **Checking:** `{original_name}`...")
-            # Use raw original name for search
-            exists = await check_file_in_channel(client, chat_id, original_name)
-            
-            if exists:
-                # Agar mil gyi to skip karo
-                # await message.reply_text(f"✅ **Found:** {original_name} (Skipping)")
-                continue 
-            
+            # File Processing
+            if SKIP_UNTIL_NAME and not FOUND_START_FILE: continue # Extra safety
+
             msg = await message.reply_text(f"⏳ **Queued:** {original_name}")
             try:
-                temp_path = await download_file_gdrive(service, file_id, original_name, msg)
+                # Use Aria2c here
+                temp_path = await download_with_aria2(file_id, original_name, msg, creds)
                 
                 final_caption = (f"📂 {parent_path}\n🎥 **{original_name}**")
 
@@ -363,10 +390,11 @@ async def handle_inputs(client, message):
 
     current_step = user_data.get(uid, {}).get('step', 'idle')
 
+    # STEP 1: Link -> Show Folders
     if current_step == 'idle' or "drive.google.com" in text:
         try:
             folder_id = get_file_id_from_url(text)
-            service = get_gdrive_service()
+            service, creds = get_gdrive_service() # Get creds too
             msg = await message.reply_text("🔍 **Scanning for folders...**")
             
             query = f"'{folder_id}' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder'"
@@ -385,12 +413,13 @@ async def handle_inputs(client, message):
             for f in folders:
                 list_text += f"`{f['name']}`\n"
             
-            list_text += "\n👇 **Copy & Send names of folders to download.**\n(You can send multiple names)."
+            list_text += "\n👇 **Copy & Send names of folders to download.**"
             await msg.edit(list_text)
 
         except Exception as e:
             await message.reply_text(f"❌ Error: {e}")
 
+    # STEP 2: Handle Selection -> Ask Start File
     elif current_step == 'ask_selection':
         folder_map = user_data[uid].get('folder_map', {})
         selected_names = text.split('\n')
@@ -404,27 +433,58 @@ async def handle_inputs(client, message):
         if not valid_folders:
             await message.reply_text("❌ No valid folder names found. Copy exactly from list.")
             return
-
-        await message.reply_text(f"✅ Selected {len(valid_folders)} folders. Starting...")
         
-        global STOP_PROCESS, FOLDER_INDEX
+        # Save Selection and move to next step
+        user_data[uid]['valid_folders'] = valid_folders
+        user_data[uid]['step'] = 'ask_start_file'
+        
+        await message.reply_text(
+            f"✅ Selected {len(valid_folders)} folders.\n\n"
+            "❓ **Do you want to start from a specific file?**\n"
+            "- Send **File Name** to start from there.\n"
+            "- Send **NO** to download everything."
+        )
+
+    # STEP 3: Handle Start File -> Start Process
+    elif current_step == 'ask_start_file':
+        start_from = text
+        valid_folders = user_data[uid]['valid_folders']
+        
+        global STOP_PROCESS, FOLDER_INDEX, SKIP_UNTIL_NAME, FOUND_START_FILE
         STOP_PROCESS = False
         FOLDER_INDEX = []
-        service = get_gdrive_service()
         
-        progress_msg = await message.reply_text("🚀 **Initializing...**")
+        # Logic for Skip
+        if start_from.upper() == "NO":
+            SKIP_UNTIL_NAME = None
+            FOUND_START_FILE = True # Treat as found immediately
+            await message.reply_text("🚀 **Starting Full Download...**")
+        else:
+            SKIP_UNTIL_NAME = start_from
+            FOUND_START_FILE = False
+            await message.reply_text(f"🚀 **Searching for '{start_from}' to start...**")
+
+        service, creds = get_gdrive_service()
+        progress_msg = await message.reply_text("⚙️ **Initializing Aria2c...**")
 
         for name, fid in valid_folders:
             if STOP_PROCESS: break
-            # Pin only the Root Selection (Problem 2 Solved)
-            await recursive_process(client, service, fid, uid, progress_msg, parent_path="", is_root_selection=True)
+            
+            # Problem 2 Solved: Pin ONLY Main Folder Name Here
+            chat_id = load_config().get("channel_id")
+            sent_msg = await client.send_message(chat_id, f"📂 **{name}**")
+            try: await client.pin_chat_message(chat_id, sent_msg.id)
+            except: pass
+            
+            # Start Recursion
+            await recursive_process(client, service, creds, fid, uid, progress_msg, parent_path="")
         
         if not STOP_PROCESS:
             if FOLDER_INDEX:
                 index_text = "📑 **Index:**\n\n" + "\n".join(FOLDER_INDEX)
                 if len(index_text) > 4000: index_text = index_text[:4000] + "..."
-                await client.send_message(config.get("channel_id"), index_text)
-            await message.reply_text("✅ **All Selected Tasks Completed!**")
+                await client.send_message(load_config().get("channel_id"), index_text)
+            await message.reply_text("✅ **All Tasks Completed!**")
         
         user_data[uid] = {'step': 'idle'}
 
