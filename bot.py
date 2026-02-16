@@ -32,58 +32,41 @@ bot = Client("pro_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 # Global Variables
 user_data = {}
 STOP_PROCESS = False
-FILE_COUNTER = 0  # Global index counter
-FOLDER_INDEX = [] # To store folder name and msg link
+FOLDER_INDEX = [] 
 
-# --- CONFIG MANAGEMENT (Problem 2) ---
+# --- CONFIG MANAGEMENT ---
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
-        except:
-            return {}
+            with open(CONFIG_FILE, "r") as f: return json.load(f)
+        except: return {}
     return {}
 
 def save_config(data):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(data, f)
+    with open(CONFIG_FILE, "w") as f: json.dump(data, f)
 
 # --- HELPER FUNCTIONS ---
 
-# Problem 1: Get Video Attributes for Perfect Size
 def get_video_attributes(file_path):
     try:
-        # FFPROBE se Width, Height, Duration nikalenge
-        cmd = [
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", file_path
-        ]
+        cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0",
+               "-show_entries", "stream=width,height,duration",
+               "-of", "default=noprint_wrappers=1:nokey=1", file_path]
         output = subprocess.check_output(cmd).decode("utf-8").strip().split("\n")
-        
         width = int(output[0]) if len(output) > 0 and output[0].isdigit() else 0
         height = int(output[1]) if len(output) > 1 and output[1].isdigit() else 0
-        # Duration seconds me hoti hai, int me badalna padega
         duration = 0
         if len(output) > 2:
-            try:
-                duration = int(float(output[2]))
-            except:
-                pass
-                
+            try: duration = int(float(output[2]))
+            except: pass
         return width, height, duration
-    except Exception as e:
-        print(f"Metadata Error: {e}")
-        return 0, 0, 0
+    except: return 0, 0, 0
 
 async def generate_thumbnail(video_path):
     thumb_path = f"{video_path}.jpg"
     try:
-        subprocess.run(
-            ["ffmpeg", "-i", video_path, "-ss", "00:00:02", "-vframes", "1", thumb_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
-        )
+        subprocess.run(["ffmpeg", "-i", video_path, "-ss", "00:00:02", "-vframes", "1", thumb_path],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         if os.path.exists(thumb_path): return thumb_path
     except: pass
     return None
@@ -109,7 +92,6 @@ def time_formatter(milliseconds: int) -> str:
         ((str(minutes) + "m, ") if minutes else "") + \
         ((str(seconds) + "s, ") if seconds else "")
 
-# Problem 3: Fancy Progress Bar
 async def progress(current, total, message, start_time, status_text):
     now = time.time()
     diff = now - start_time
@@ -119,7 +101,6 @@ async def progress(current, total, message, start_time, status_text):
         if speed == 0: speed = 1 
         time_to_completion = round((total - current) / speed) * 1000
         
-        # Fancy Bar: ▰▰▰▱▱▱
         filled_length = int(10 * percentage // 100)
         bar = '▰' * filled_length + '▱' * (10 - filled_length)
         
@@ -133,7 +114,6 @@ async def progress(current, total, message, start_time, status_text):
         try: await message.edit(tmp)
         except: pass
 
-# Problem 5: Pre-Count Files
 async def count_total_files(service, folder_id):
     total = 0
     query = f"'{folder_id}' in parents and trashed = false"
@@ -143,7 +123,7 @@ async def count_total_files(service, folder_id):
         items = results.get('files', [])
         for item in items:
             if item['mimeType'] == 'application/vnd.google-apps.folder':
-                total += await count_total_files(service, item['id']) # Recursive count
+                total += await count_total_files(service, item['id']) 
             else:
                 total += 1
         page_token = results.get('nextPageToken')
@@ -188,13 +168,11 @@ async def upload_file(client, file_path, display_name, chat_id, caption, message
     thumb_path = None
     width, height, duration = 0, 0, 0
 
-    # Video Processing
     if display_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')) and not is_part:
         status_text = f"⚙️ **Processing Video:**\n`{display_name}`"
         try:
             await message.edit(status_text)
             thumb_path = await generate_thumbnail(file_path)
-            # Metadata fetch
             width, height, duration = get_video_attributes(file_path)
         except: pass
         status_text = f"⬆️ **Uploading:**\n`{display_name}`"
@@ -203,7 +181,7 @@ async def upload_file(client, file_path, display_name, chat_id, caption, message
         if display_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
              await client.send_video(
                 chat_id, video=file_path, caption=caption, file_name=display_name,
-                thumb=thumb_path, width=width, height=height, duration=duration, # <-- Attributes added
+                thumb=thumb_path, width=width, height=height, duration=duration,
                 progress=progress, progress_args=(message, start_time, status_text),
                 supports_streaming=True
             )
@@ -214,14 +192,13 @@ async def upload_file(client, file_path, display_name, chat_id, caption, message
             )
     except Exception as e:
         print(f"Upload Error: {e}")
-        # Fallback to document
         await client.send_document(chat_id, document=file_path, caption=caption, file_name=display_name)
     finally:
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
 
 # --- RECURSIVE CORE ---
 async def recursive_process(client, service, folder_id, user_id, message, parent_path=""):
-    global STOP_PROCESS, FILE_COUNTER, FOLDER_INDEX
+    global STOP_PROCESS, FOLDER_INDEX
     if STOP_PROCESS: return
 
     config = load_config()
@@ -242,31 +219,25 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
         mime_type = item['mimeType']
 
         if mime_type == 'application/vnd.google-apps.folder':
-            # Folder Name send karna and store karna index ke liye
             full_folder_name = f"📂 {parent_path}{original_name}"
             sent_msg = await client.send_message(chat_id, f"**{full_folder_name}**")
             
-            # Problem 7: Index Link Storage
-            # Format: Name -> Link (https://t.me/c/CHANNEL_ID/MSG_ID)
-            # Channel ID start with -100, remove -100 for link
+            # PIN logic: Only Pin if it's the top-level selected folder
+            if parent_path == "":
+                try: await client.pin_chat_message(chat_id, sent_msg.id)
+                except: pass
+
             clean_cid = str(chat_id).replace("-100", "")
             msg_link = f"https://t.me/c/{clean_cid}/{sent_msg.id}"
             FOLDER_INDEX.append(f"[{original_name}]({msg_link})")
 
             await recursive_process(client, service, file_id, user_id, message, parent_path + original_name + " / ")
         else:
-            FILE_COUNTER += 1 # Increment Counter
             msg = await message.reply_text(f"⏳ **Queued:** {original_name}")
             try:
                 temp_path = await download_file_gdrive(service, file_id, original_name, msg)
                 
-                # Problem 6: Auto Caption with Index
-                # Format: #1 \n FolderPath \n FileName
-                final_caption = (
-                    f"#{FILE_COUNTER}\n"
-                    f"📂 {parent_path}\n"
-                    f"🎥 **{original_name}**"
-                )
+                final_caption = (f"📂 {parent_path}\n🎥 **{original_name}**")
 
                 f_size = os.path.getsize(temp_path)
                 LIMIT = 1.9 * 1024 * 1024 * 1024 
@@ -281,11 +252,9 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
                             if STOP_PROCESS: raise Exception("Stopped")
                             chunk = f.read(int(LIMIT))
                             if not chunk: break
-                            
                             part_temp = f"{temp_path}_part{part_num}"
                             part_name = f"{original_name}.part{part_num}"
                             with open(part_temp, 'wb') as p: p.write(chunk)
-                            
                             p_cap = f"{final_caption}\n\n**Part {part_num}**"
                             await upload_file(client, part_temp, part_name, chat_id, p_cap, msg, is_part=True)
                             if os.path.exists(part_temp): os.remove(part_temp)
@@ -299,18 +268,16 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
                 if os.path.exists(f"./temp_{file_id}"): os.remove(f"./temp_{file_id}")
                 await msg.delete()
 
-# --- COMMANDS ---
+# --- COMMANDS & HANDLERS ---
 
 @bot.on_message(filters.command("setchannel") & filters.private)
 async def set_channel(client, message):
-    if len(message.command) < 2:
-        return await message.reply_text("Usage: `/setchannel -100xxxxxxx`")
+    if len(message.command) < 2: return await message.reply_text("Usage: `/setchannel -100xxxxxxx`")
     try:
         cid = int(message.command[1])
         save_config({"channel_id": cid})
         await message.reply_text(f"✅ Channel ID set to: `{cid}`")
-    except:
-        await message.reply_text("❌ Invalid ID format.")
+    except: await message.reply_text("❌ Invalid ID format.")
 
 @bot.on_message(filters.command("removeid") & filters.private)
 async def remove_channel(client, message):
@@ -325,79 +292,99 @@ async def stop_cmd(client, message):
 
 @bot.on_message(filters.command("start") & filters.private)
 async def start(client, message):
+    user_data[message.from_user.id] = {'step': 'idle'}
     config = load_config()
     if not config.get("channel_id"):
-        await message.reply_text(
-            "👋 **Welcome!**\n\n"
-            "First, set the channel using:\n"
-            "`/setchannel -100xxxxxxxxx`\n\n"
-            "(Make sure I am Admin in that channel)"
-        )
+        await message.reply_text("👋 **Welcome!**\nFirst, set channel: `/setchannel -100xxxxxxxxx`")
     else:
-        await message.reply_text(
-            f"✅ **Channel Configured:** `{config['channel_id']}`\n"
-            "Send me a **Google Drive Link** to start."
-        )
+        await message.reply_text(f"✅ **Channel Configured:** `{config['channel_id']}`\nSend me a Link.")
 
 @bot.on_message(filters.text & filters.private)
-async def handle_link(client, message):
+async def handle_inputs(client, message):
     text = message.text.strip()
+    uid = message.from_user.id
     if text.startswith("/"): return
 
     config = load_config()
-    chat_id = config.get("channel_id")
-    if not chat_id:
+    if not config.get("channel_id"):
         return await message.reply_text("❌ Please set channel first using `/setchannel`")
 
-    try:
-        global STOP_PROCESS, FILE_COUNTER, FOLDER_INDEX
+    # Step Management
+    current_step = user_data.get(uid, {}).get('step', 'idle')
+
+    # STEP 1: Handle Link -> Show Folders
+    if current_step == 'idle' or "drive.google.com" in text:
+        try:
+            folder_id = get_file_id_from_url(text)
+            service = get_gdrive_service()
+            msg = await message.reply_text("🔍 **Scanning for folders...**")
+            
+            # Fetch ONLY Folders from root
+            query = f"'{folder_id}' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder'"
+            results = service.files().list(q=query, fields="files(id, name)").execute()
+            folders = results.get('files', [])
+            folders.sort(key=lambda x: natural_sort_key(x['name']))
+
+            if not folders:
+                await msg.edit("❌ No folders found in this link.\n(Files in root are skipped in selective mode).")
+                return
+
+            # Store map {Name: ID}
+            folder_map = {f['name']: f['id'] for f in folders}
+            user_data[uid] = {'step': 'ask_selection', 'folder_map': folder_map}
+
+            # Create List Text
+            list_text = "**Found Folders:**\n\n"
+            for f in folders:
+                list_text += f"`{f['name']}`\n"
+            
+            list_text += "\n👇 **Copy & Send the names of folders you want to download.**\n(You can send multiple names in separate lines)."
+            
+            await msg.edit(list_text)
+
+        except Exception as e:
+            await message.reply_text(f"❌ Error: {e}")
+
+    # STEP 2: Handle Selection -> Start Download
+    elif current_step == 'ask_selection':
+        folder_map = user_data[uid].get('folder_map', {})
+        selected_names = text.split('\n')
+        valid_folders = []
+
+        for name in selected_names:
+            clean_name = name.strip()
+            if clean_name in folder_map:
+                valid_folders.append((clean_name, folder_map[clean_name]))
+        
+        if not valid_folders:
+            await message.reply_text("❌ No valid folder names found. Please copy exactly from the list.")
+            return
+
+        await message.reply_text(f"✅ Selected {len(valid_folders)} folders. Starting...")
+        
+        global STOP_PROCESS, FOLDER_INDEX
         STOP_PROCESS = False
-        FILE_COUNTER = 0
         FOLDER_INDEX = []
-
-        folder_id = get_file_id_from_url(text)
         service = get_gdrive_service()
+        
+        progress_msg = await message.reply_text("🚀 **Initializing...**")
 
-        status_msg = await message.reply_text("🔍 **Scanning Drive... Please Wait...**")
-        
-        # Problem 5: Counting Files
-        total_files = await count_total_files(service, folder_id)
-        
-        # Get Root Folder Name for Pinning
-        root_meta = service.files().get(fileId=folder_id, fields="name").execute()
-        root_name = root_meta.get('name', 'Drive Folder')
-        
-        await status_msg.edit(
-            f"📂 **Folder Found:** `{root_name}`\n"
-            f"📄 **Total Files:** `{total_files}`\n\n"
-            "🚀 Starting in 10 seconds..."
-        )
-        
-        # Problem 4: Pin First Message in Channel
-        root_msg = await client.send_message(chat_id, f"💿 **Drive Upload Started:**\n`{root_name}`")
-        try: await client.pin_chat_message(chat_id, root_msg.id)
-        except: pass
-
-        await asyncio.sleep(10)
-        await status_msg.delete()
-        
-        progress_msg = await message.reply_text("🚀 **Starting Download...**")
-        
-        await recursive_process(client, service, folder_id, message.from_user.id, progress_msg)
+        for name, fid in valid_folders:
+            if STOP_PROCESS: break
+            # Process each selected folder as a "Root"
+            # Parent path empty rakha hai taaki ye main folder treat ho aur Pin ho
+            await recursive_process(client, service, fid, uid, progress_msg, parent_path="")
         
         if not STOP_PROCESS:
-            # Problem 7: Index Message
             if FOLDER_INDEX:
-                index_text = "📑 **Index of Uploaded Folders:**\n\n" + "\n".join(FOLDER_INDEX)
-                # Split if too long
-                if len(index_text) > 4000:
-                    index_text = index_text[:4000] + "\n...(truncated)"
-                await client.send_message(chat_id, index_text)
-
-            await message.reply_text("✅ **Task Completed Successfully!**")
-
-    except Exception as e:
-        await message.reply_text(f"❌ Error: {e}")
+                index_text = "📑 **Index:**\n\n" + "\n".join(FOLDER_INDEX)
+                if len(index_text) > 4000: index_text = index_text[:4000] + "..."
+                config = load_config()
+                await client.send_message(config.get("channel_id"), index_text)
+            await message.reply_text("✅ **All Selected Tasks Completed!**")
+        
+        # Reset
+        user_data[uid] = {'step': 'idle'}
 
 # --- WEB SERVER ---
 async def web_server():
