@@ -3,6 +3,8 @@ import time
 import math
 import asyncio
 import shutil
+import re
+import subprocess
 from aiohttp import web
 from pyrogram import Client, filters, idle
 from google.oauth2 import service_account
@@ -26,10 +28,32 @@ SERVICE_ACCOUNT_FILE = 'credentials.json'
 bot = Client("render_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 user_data = {}
-# Global Flag to control stopping
 STOP_PROCESS = False
 
 # --- HELPER FUNCTIONS ---
+
+# 1. Natural Sorting Key (Taaki 1 ke baad 2 aaye, 10 nahi)
+def natural_sort_key(s):
+    return [int(text) if text.isdigit() else text.lower()
+            for text in re.split(r'(\d+)', s)]
+
+# 2. Thumbnail Generator
+async def generate_thumbnail(video_path):
+    thumb_path = f"{video_path}.jpg"
+    try:
+        # FFMPEG se 2nd second ka snapshot lenge
+        subprocess.run(
+            ["ffmpeg", "-i", video_path, "-ss", "00:00:02", "-vframes", "1", thumb_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True
+        )
+        if os.path.exists(thumb_path):
+            return thumb_path
+    except Exception as e:
+        print(f"Thumb Error: {e}")
+    return None
+
 def humanbytes(size):
     if not size: return ""
     power = 2**10
@@ -87,8 +111,6 @@ def get_file_id_from_url(url):
     return url
 
 async def download_file_gdrive(service, file_id, original_name, message):
-    # TRICK: Hum file ko ID ke naam se save karenge taaki Symbols ka error na aaye
-    # Linux doesn't like special chars like | or : or ?
     temp_filename = f"temp_{file_id}" 
     file_path = f"./{temp_filename}"
     
@@ -101,12 +123,9 @@ async def download_file_gdrive(service, file_id, original_name, message):
         downloader = MediaIoBaseDownload(fh, request, chunksize=50 * 1024 * 1024)
         done = False
         while done is False:
-            if STOP_PROCESS: # Stop Check
-                raise Exception("Stopped by User")
-                
+            if STOP_PROCESS: raise Exception("Stopped by User")
             status, done = downloader.next_chunk()
             if status:
-                # Progress me original naam dikhayenge
                 await progress(int(status.resumable_progress), total_size, message, start_time, f"⬇️ **Downloading:** {original_name}")
                 
     return file_path
@@ -117,16 +136,26 @@ async def upload_file(client, file_path, display_name, chat_id, caption, message
     status_text = f"⬆️ **Uploading:** {display_name}"
     if is_part: status_text = f"⬆️ **Uploading Part:** {display_name}"
 
+    thumb_path = None
+    
+    # Video Thumbnail Logic
+    if display_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov')) and not is_part:
+        status_text = f"🖼 **Generating Thumbnail:** {display_name}"
+        try:
+            await message.edit(status_text)
+            thumb_path = await generate_thumbnail(file_path)
+            status_text = f"⬆️ **Uploading:** {display_name}"
+        except:
+            pass
+
     try:
-        # Note: 'file_name' parameter in send_document allows us to 
-        # send 'temp_123' but show it as 'Original Name.pdf' to user.
-        
         if display_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov')):
              await client.send_video(
                 chat_id, 
                 video=file_path, 
                 caption=caption,
-                file_name=display_name, # <-- Original Name here
+                file_name=display_name,
+                thumb=thumb_path,  # <-- Thumbnail added here
                 progress=progress, 
                 progress_args=(message, start_time, status_text),
                 supports_streaming=True
@@ -136,34 +165,40 @@ async def upload_file(client, file_path, display_name, chat_id, caption, message
                 chat_id, 
                 document=file_path, 
                 caption=caption,
-                file_name=display_name, # <-- Original Name here
+                file_name=display_name,
                 progress=progress, 
                 progress_args=(message, start_time, status_text)
             )
     except Exception as e:
         print(f"Upload Error: {e}")
-        # Retry as document
         await client.send_document(
             chat_id, 
             document=file_path, 
             caption=caption,
             file_name=display_name 
         )
+    finally:
+        # Clean up thumbnail
+        if thumb_path and os.path.exists(thumb_path):
+            os.remove(thumb_path)
 
 async def recursive_process(client, service, folder_id, user_id, message, parent_path=""):
     global STOP_PROCESS
-    
-    # Check Stop Signal
     if STOP_PROCESS: return
 
     chat_id = user_data[user_id]['channel_id']
     custom_caption = user_data[user_id]['caption']
     
     query = f"'{folder_id}' in parents and trashed = false"
-    results = service.files().list(q=query, orderBy="name", fields="nextPageToken, files(id, name, mimeType)").execute()
+    # Note: orderBy hataya nahi hai, par hum Python me re-sort karenge
+    results = service.files().list(q=query, fields="nextPageToken, files(id, name, mimeType)").execute()
     items = results.get('files', [])
 
     if not items: return
+
+    # --- CRITICAL FIX: NATURAL SORTING ---
+    # Python me sort kar rahe hain taaki 1, 2, 10 wala issue fix ho jaye
+    items.sort(key=lambda x: natural_sort_key(x['name']))
 
     for item in items:
         if STOP_PROCESS: 
@@ -180,17 +215,14 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
         else:
             msg = await message.reply_text(f"⏳ **Queued:** {original_name}")
             try:
-                # 1. Download (Saves as temp_ID)
                 temp_path = await download_file_gdrive(service, file_id, original_name, msg)
                 
                 final_caption = original_name if custom_caption == "SKIP" else f"{custom_caption}\n\n{original_name}"
                 
-                # Check Size
                 f_size = os.path.getsize(temp_path)
                 LIMIT = 1.9 * 1024 * 1024 * 1024 
                 
                 if f_size <= LIMIT:
-                    # Upload (Sends temp_ID but displays Original Name)
                     await upload_file(client, temp_path, original_name, chat_id, final_caption, msg)
                 else:
                     await msg.edit(f"✂️ **Splitting File:** {humanbytes(f_size)}")
@@ -213,7 +245,6 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
                             if os.path.exists(part_temp_path): os.remove(part_temp_path)
                             part_num += 1
 
-                # Cleanup
                 if os.path.exists(temp_path): os.remove(temp_path)
                 await msg.delete()
                 
@@ -221,7 +252,7 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
                 error_str = str(e)
                 if "Stopped by User" in error_str:
                     await msg.delete()
-                    return # Exit function
+                    return 
                 else:
                     await client.send_message(user_id, f"❌ **Error with {original_name}:**\n{error_str}")
                     if os.path.exists(f"./temp_{file_id}"): os.remove(f"./temp_{file_id}")
@@ -233,12 +264,12 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
 async def stop_command(client, message):
     global STOP_PROCESS
     STOP_PROCESS = True
-    await message.reply_text("🛑 **Stopping process...** \n(It might take a few seconds to finish current file).")
+    await message.reply_text("🛑 **Stopping process...**")
 
 @bot.on_message(filters.command("start") & filters.private)
 async def start(client, message):
     global STOP_PROCESS
-    STOP_PROCESS = False # Reset flag on start
+    STOP_PROCESS = False
     user_data[message.from_user.id] = {'step': 'ask_channel'}
     await message.reply_text("👋 **Drive to Telegram Bot**\n\n1. Send Target Channel ID (e.g., `-100xxxx`).")
 
@@ -246,10 +277,7 @@ async def start(client, message):
 async def handle_inputs(client, message):
     uid = message.from_user.id
     text = message.text.strip()
-    
-    # Check for commands in text handler
     if text.startswith("/"): return
-
     if uid not in user_data: return await message.reply_text("/start first.")
     step = user_data[uid].get('step')
 
@@ -260,28 +288,21 @@ async def handle_inputs(client, message):
             await message.reply_text("✅ Channel Set.\n\n2. Send **Caption** (or `SKIP`).")
         else:
             await message.reply_text("❌ Invalid ID.")
-            
     elif step == 'ask_caption':
         user_data[uid]['caption'] = text
         user_data[uid]['step'] = 'ask_link'
         await message.reply_text("✅ Caption Set.\n\n3. Send **Drive Link**.")
-        
     elif step == 'ask_link':
         try:
             global STOP_PROCESS
             STOP_PROCESS = False
-            
             folder_id = get_file_id_from_url(text)
             service = get_gdrive_service()
-            await message.reply_text(f"🚀 **Processing Started...**\nUse /stop to cancel.")
+            await message.reply_text(f"🚀 **Processing Started...**\nSorting files correctly (1, 2, 3...)")
             await recursive_process(client, service, folder_id, uid, message)
-            
             if not STOP_PROCESS:
                 await message.reply_text("✅ **All Files Uploaded Successfully!**")
-            
-            # Reset
             if uid in user_data: del user_data[uid]
-            
         except Exception as e:
             await message.reply_text(f"Error: {e}")
 
