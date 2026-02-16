@@ -8,6 +8,7 @@ import json
 import subprocess
 from aiohttp import web
 from pyrogram import Client, filters, idle
+from pyrogram.types import BotCommand
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -65,8 +66,11 @@ def get_video_attributes(file_path):
 async def generate_thumbnail(video_path):
     thumb_path = f"{video_path}.jpg"
     try:
-        subprocess.run(["ffmpeg", "-i", video_path, "-ss", "00:00:02", "-vframes", "1", thumb_path],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        # Run ffmpeg in thread to prevent blocking
+        await asyncio.to_thread(subprocess.run, 
+            ["ffmpeg", "-i", video_path, "-ss", "00:00:02", "-vframes", "1", thumb_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+        )
         if os.path.exists(thumb_path): return thumb_path
     except: pass
     return None
@@ -119,7 +123,10 @@ async def count_total_files(service, folder_id):
     query = f"'{folder_id}' in parents and trashed = false"
     page_token = None
     while True:
-        results = service.files().list(q=query, fields="nextPageToken, files(id, mimeType)", pageToken=page_token).execute()
+        # Run blocking API call in thread
+        results = await asyncio.to_thread(
+            service.files().list(q=query, fields="nextPageToken, files(id, mimeType)", pageToken=page_token).execute
+        )
         items = results.get('files', [])
         for item in items:
             if item['mimeType'] == 'application/vnd.google-apps.folder':
@@ -129,6 +136,18 @@ async def count_total_files(service, folder_id):
         page_token = results.get('nextPageToken')
         if not page_token: break
     return total
+
+# Problem 3: Check if file exists in Channel (Resume Logic)
+async def check_file_in_channel(client, chat_id, file_name):
+    try:
+        # Channel me search karenge. Agar file name mil gya to True return karenge
+        # "🎥 **FileName**" format hum use kar rahe hain, wahi search karenge
+        query = f"🎥 **{file_name}**"
+        async for message in client.search_messages(chat_id, query=query, limit=1):
+            return True
+    except:
+        return False
+    return False
 
 # --- GOOGLE DRIVE & DOWNLOAD ---
 def get_gdrive_service():
@@ -141,22 +160,31 @@ def get_file_id_from_url(url):
     elif "/d/" in url: return url.split("/d/")[1].split("/")[0]
     return url
 
+# Problem 1 & 4 Fix: Async Download Loop
 async def download_file_gdrive(service, file_id, original_name, message):
     temp_filename = f"temp_{file_id}" 
     file_path = f"./{temp_filename}"
-    request = service.files().get_media(fileId=file_id)
-    file_metadata = service.files().get(fileId=file_id, fields="size").execute()
+    
+    # Run API calls in thread
+    request = await asyncio.to_thread(service.files().get_media, fileId=file_id)
+    file_metadata = await asyncio.to_thread(service.files().get(fileId=file_id, fields="size").execute)
     total_size = int(file_metadata.get('size', 0))
     start_time = time.time()
     
+    # Open file in blocking mode but write inside thread logic
     with open(file_path, "wb") as fh:
-        downloader = MediaIoBaseDownload(fh, request, chunksize=50 * 1024 * 1024)
+        downloader = MediaIoBaseDownload(fh, request, chunksize=10 * 1024 * 1024) # Reduced chunk size for safety
         done = False
         while done is False:
             if STOP_PROCESS: raise Exception("Stopped by User")
-            status, done = downloader.next_chunk()
+            
+            # CRITICAL FIX: Run next_chunk in thread to prevent blocking event loop
+            # This enables Progress Bar to update and prevents stalling
+            status, done = await asyncio.to_thread(downloader.next_chunk)
+            
             if status:
                 await progress(int(status.resumable_progress), total_size, message, start_time, f"⬇️ **Downloading:**\n`{original_name}`")
+                
     return file_path
 
 # --- UPLOAD ---
@@ -197,7 +225,7 @@ async def upload_file(client, file_path, display_name, chat_id, caption, message
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
 
 # --- RECURSIVE CORE ---
-async def recursive_process(client, service, folder_id, user_id, message, parent_path=""):
+async def recursive_process(client, service, folder_id, user_id, message, parent_path="", is_root_selection=False):
     global STOP_PROCESS, FOLDER_INDEX
     if STOP_PROCESS: return
 
@@ -205,7 +233,7 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
     chat_id = config.get("channel_id")
     
     query = f"'{folder_id}' in parents and trashed = false"
-    results = service.files().list(q=query, fields="nextPageToken, files(id, name, mimeType)").execute()
+    results = await asyncio.to_thread(service.files().list(q=query, fields="nextPageToken, files(id, name, mimeType)").execute)
     items = results.get('files', [])
 
     if not items: return
@@ -222,8 +250,8 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
             full_folder_name = f"📂 {parent_path}{original_name}"
             sent_msg = await client.send_message(chat_id, f"**{full_folder_name}**")
             
-            # PIN logic: Only Pin if it's the top-level selected folder
-            if parent_path == "":
+            # Problem 2 Fix: Only Pin if it's the Root Selection (passed from handle_inputs)
+            if is_root_selection:
                 try: await client.pin_chat_message(chat_id, sent_msg.id)
                 except: pass
 
@@ -231,8 +259,18 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
             msg_link = f"https://t.me/c/{clean_cid}/{sent_msg.id}"
             FOLDER_INDEX.append(f"[{original_name}]({msg_link})")
 
-            await recursive_process(client, service, file_id, user_id, message, parent_path + original_name + " / ")
+            # Recursive call (is_root_selection False pass karenge taaki subfolder pin na ho)
+            await recursive_process(client, service, file_id, user_id, message, parent_path + original_name + " / ", is_root_selection=False)
         else:
+            # Problem 3 Fix: Resume Capability
+            # Check if file already exists in channel
+            await message.edit(f"🔎 **Checking:** {original_name}...")
+            exists = await check_file_in_channel(client, chat_id, original_name)
+            
+            if exists:
+                await message.reply_text(f"✅ **Skipped (Exists):** {original_name}")
+                continue # Skip download/upload
+            
             msg = await message.reply_text(f"⏳ **Queued:** {original_name}")
             try:
                 temp_path = await download_file_gdrive(service, file_id, original_name, msg)
@@ -270,6 +308,16 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
 
 # --- COMMANDS & HANDLERS ---
 
+# Problem 5 Fix: Auto Set Commands on Start
+async def set_commands(client):
+    commands = [
+        BotCommand("start", "Start Bot"),
+        BotCommand("setchannel", "Set Target Channel"),
+        BotCommand("stop", "Stop Process"),
+        BotCommand("removeid", "Remove Channel ID")
+    ]
+    await client.set_bot_commands(commands)
+
 @bot.on_message(filters.command("setchannel") & filters.private)
 async def set_channel(client, message):
     if len(message.command) < 2: return await message.reply_text("Usage: `/setchannel -100xxxxxxx`")
@@ -292,6 +340,9 @@ async def stop_cmd(client, message):
 
 @bot.on_message(filters.command("start") & filters.private)
 async def start(client, message):
+    # Auto Set Commands
+    await set_commands(client)
+    
     user_data[message.from_user.id] = {'step': 'idle'}
     config = load_config()
     if not config.get("channel_id"):
@@ -309,43 +360,36 @@ async def handle_inputs(client, message):
     if not config.get("channel_id"):
         return await message.reply_text("❌ Please set channel first using `/setchannel`")
 
-    # Step Management
     current_step = user_data.get(uid, {}).get('step', 'idle')
 
-    # STEP 1: Handle Link -> Show Folders
     if current_step == 'idle' or "drive.google.com" in text:
         try:
             folder_id = get_file_id_from_url(text)
             service = get_gdrive_service()
             msg = await message.reply_text("🔍 **Scanning for folders...**")
             
-            # Fetch ONLY Folders from root
             query = f"'{folder_id}' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder'"
-            results = service.files().list(q=query, fields="files(id, name)").execute()
+            results = await asyncio.to_thread(service.files().list(q=query, fields="files(id, name)").execute)
             folders = results.get('files', [])
             folders.sort(key=lambda x: natural_sort_key(x['name']))
 
             if not folders:
-                await msg.edit("❌ No folders found in this link.\n(Files in root are skipped in selective mode).")
+                await msg.edit("❌ No folders found. (Files in root are skipped in selective mode).")
                 return
 
-            # Store map {Name: ID}
             folder_map = {f['name']: f['id'] for f in folders}
             user_data[uid] = {'step': 'ask_selection', 'folder_map': folder_map}
 
-            # Create List Text
             list_text = "**Found Folders:**\n\n"
             for f in folders:
                 list_text += f"`{f['name']}`\n"
             
-            list_text += "\n👇 **Copy & Send the names of folders you want to download.**\n(You can send multiple names in separate lines)."
-            
+            list_text += "\n👇 **Copy & Send names of folders to download.**\n(You can send multiple names)."
             await msg.edit(list_text)
 
         except Exception as e:
             await message.reply_text(f"❌ Error: {e}")
 
-    # STEP 2: Handle Selection -> Start Download
     elif current_step == 'ask_selection':
         folder_map = user_data[uid].get('folder_map', {})
         selected_names = text.split('\n')
@@ -357,7 +401,7 @@ async def handle_inputs(client, message):
                 valid_folders.append((clean_name, folder_map[clean_name]))
         
         if not valid_folders:
-            await message.reply_text("❌ No valid folder names found. Please copy exactly from the list.")
+            await message.reply_text("❌ No valid folder names found. Copy exactly from list.")
             return
 
         await message.reply_text(f"✅ Selected {len(valid_folders)} folders. Starting...")
@@ -371,9 +415,8 @@ async def handle_inputs(client, message):
 
         for name, fid in valid_folders:
             if STOP_PROCESS: break
-            # Process each selected folder as a "Root"
-            # Parent path empty rakha hai taaki ye main folder treat ho aur Pin ho
-            await recursive_process(client, service, fid, uid, progress_msg, parent_path="")
+            # Pass is_root_selection=True ONLY here so only these get pinned
+            await recursive_process(client, service, fid, uid, progress_msg, parent_path="", is_root_selection=True)
         
         if not STOP_PROCESS:
             if FOLDER_INDEX:
@@ -383,7 +426,6 @@ async def handle_inputs(client, message):
                 await client.send_message(config.get("channel_id"), index_text)
             await message.reply_text("✅ **All Selected Tasks Completed!**")
         
-        # Reset
         user_data[uid] = {'step': 'idle'}
 
 # --- WEB SERVER ---
