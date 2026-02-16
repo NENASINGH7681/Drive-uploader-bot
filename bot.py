@@ -3,24 +3,18 @@ import time
 import math
 import asyncio
 import shutil
-# High speed event loop policy check
-try:
-    import uvloop
-    uvloop.install()
-except ImportError:
-    pass
-
 from pyrogram import Client, filters
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION FROM ENV VARIABLES ---
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CREDENTIALS_JSON = os.environ.get("GDRIVE_CREDENTIALS_JSON")
 
+# Credentials File Write Logic
 if CREDENTIALS_JSON:
     with open("credentials.json", "w") as f:
         f.write(CREDENTIALS_JSON)
@@ -29,9 +23,9 @@ SCOPES = ['https://www.googleapis.com/auth/drive']
 SERVICE_ACCOUNT_FILE = 'credentials.json'
 
 # --- INITIALIZE BOT ---
-# tgcrypto will be used automatically if installed
-bot = Client("speedy_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+bot = Client("render_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
+# User State Data
 user_data = {}
 
 # --- HELPER FUNCTIONS ---
@@ -63,9 +57,8 @@ async def progress(current, total, message, start_time, status_text):
         percentage = current * 100 / total
         speed = current / diff
         elapsed_time = round(diff) * 1000
-        if speed == 0: speed = 1 # avoid zero division
+        if speed == 0: speed = 1 
         time_to_completion = round((total - current) / speed) * 1000
-        estimated_total_time = elapsed_time + time_to_completion
         
         progress_str = "[{0}{1}] {2}%\n".format(
             ''.join(["●" for i in range(math.floor(percentage / 10))]),
@@ -82,7 +75,7 @@ async def progress(current, total, message, start_time, status_text):
         except:
             pass
 
-# --- GOOGLE DRIVE OPTIMIZED DOWNLOAD ---
+# --- GOOGLE DRIVE FUNCTIONS ---
 
 def get_gdrive_service():
     creds = service_account.Credentials.from_service_account_file(
@@ -99,14 +92,14 @@ async def download_file_gdrive(service, file_id, file_name, message):
     request = service.files().get_media(fileId=file_id)
     file_path = f"./{file_name}"
     
+    # Get Size
     file_metadata = service.files().get(fileId=file_id, fields="size").execute()
     total_size = int(file_metadata.get('size', 0))
     
     start_time = time.time()
     
+    # High Speed Download (50MB Chunk)
     with open(file_path, "wb") as fh:
-        # HIGH SPEED SETTING: Chunk size increased to 50MB
-        # This reduces HTTP requests overhead significantly
         downloader = MediaIoBaseDownload(fh, request, chunksize=50 * 1024 * 1024)
         done = False
         while done is False:
@@ -116,7 +109,7 @@ async def download_file_gdrive(service, file_id, file_name, message):
                 
     return file_path
 
-# --- UPLOAD & LOGIC ---
+# --- UPLOAD & SPLIT LOGIC ---
 
 async def upload_file(client, file_path, file_name, chat_id, caption, message, is_part=False):
     start_time = time.time()
@@ -144,6 +137,7 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
     custom_caption = user_data[user_id]['caption']
     
     query = f"'{folder_id}' in parents and trashed = false"
+    # Files ko Name se sort karke laana
     results = service.files().list(q=query, orderBy="name", fields="nextPageToken, files(id, name, mimeType)").execute()
     items = results.get('files', [])
 
@@ -156,15 +150,18 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
 
         if mime_type == 'application/vnd.google-apps.folder':
             await client.send_message(chat_id, f"📂 **{parent_path}{file_name}**")
+            # Subfolder me jana
             await recursive_process(client, service, file_id, user_id, message, parent_path + file_name + " / ")
         else:
             try:
                 msg = await message.reply_text(f"⏳ **Queued:** {file_name}")
+                
+                # Download
                 file_path = await download_file_gdrive(service, file_id, file_name, msg)
                 
                 final_caption = file_name if custom_caption == "SKIP" else f"{custom_caption}\n\n{file_name}"
                 
-                # Check Size for Split
+                # Check Size for Split (1.9 GB Limit)
                 f_size = os.path.getsize(file_path)
                 LIMIT = 1.9 * 1024 * 1024 * 1024 
                 
@@ -177,15 +174,18 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
                         while True:
                             chunk = f.read(int(LIMIT))
                             if not chunk: break
+                            
                             part_name = f"{file_name}.part{part_num}"
                             part_path = f"./{part_name}"
                             with open(part_path, 'wb') as p: p.write(chunk)
                             
                             part_caption = f"{final_caption}\n\n**Part {part_num}**"
                             await upload_file(client, part_path, part_name, chat_id, part_caption, msg, is_part=True)
+                            
                             os.remove(part_path)
                             part_num += 1
 
+                # Cleanup
                 if os.path.exists(file_path): os.remove(file_path)
                 await msg.delete()
                 
@@ -197,14 +197,18 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
 @bot.on_message(filters.command("start") & filters.private)
 async def start(client, message):
     user_data[message.from_user.id] = {'step': 'ask_channel'}
-    await message.reply_text("👋 **High Speed Drive Bot**\n\n1. Send Target Channel ID (e.g., `-100xxxx`).\n(Make sure I am Admin there).")
+    await message.reply_text(
+        "👋 **Google Drive to Telegram Bot**\n\n"
+        "1. Send Target Channel ID (e.g., `-100xxxx`).\n"
+        "(Make sure I am Admin there)."
+    )
 
 @bot.on_message(filters.text & filters.private)
 async def handle_inputs(client, message):
     uid = message.from_user.id
     text = message.text.strip()
     
-    if uid not in user_data: return await message.reply_text("/start first.")
+    if uid not in user_data: return await message.reply_text("Please /start first.")
     step = user_data[uid].get('step')
 
     if step == 'ask_channel':
@@ -213,7 +217,7 @@ async def handle_inputs(client, message):
             user_data[uid]['step'] = 'ask_caption'
             await message.reply_text("✅ Channel Set.\n\n2. Send **Custom Caption** (or `SKIP`).")
         else:
-            await message.reply_text("❌ Invalid ID. Starts with -100...")
+            await message.reply_text("❌ Invalid ID. It must start with -100...")
 
     elif step == 'ask_caption':
         user_data[uid]['caption'] = text
@@ -224,9 +228,9 @@ async def handle_inputs(client, message):
         try:
             folder_id = get_file_id_from_url(text)
             service = get_gdrive_service()
-            await message.reply_text(f"🚀 **Processing Started...**")
+            await message.reply_text(f"🚀 **Processing Started...**\nSit back and relax!")
             await recursive_process(client, service, folder_id, uid, message)
-            await message.reply_text("✅ **Task Completed!**")
+            await message.reply_text("✅ **All Files Uploaded Successfully!**")
             del user_data[uid]
         except Exception as e:
             await message.reply_text(f"Error: {e}")
