@@ -66,7 +66,6 @@ def get_video_attributes(file_path):
 async def generate_thumbnail(video_path):
     thumb_path = f"{video_path}.jpg"
     try:
-        # Run ffmpeg in thread to prevent blocking
         await asyncio.to_thread(subprocess.run, 
             ["ffmpeg", "-i", video_path, "-ss", "00:00:02", "-vframes", "1", thumb_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
@@ -123,7 +122,6 @@ async def count_total_files(service, folder_id):
     query = f"'{folder_id}' in parents and trashed = false"
     page_token = None
     while True:
-        # Run blocking API call in thread
         results = await asyncio.to_thread(
             service.files().list(q=query, fields="nextPageToken, files(id, mimeType)", pageToken=page_token).execute
         )
@@ -137,16 +135,30 @@ async def count_total_files(service, folder_id):
         if not page_token: break
     return total
 
-# Problem 3: Check if file exists in Channel (Resume Logic)
+# --- CRITICAL FIX: SEARCH LOGIC ---
 async def check_file_in_channel(client, chat_id, file_name):
     try:
-        # Channel me search karenge. Agar file name mil gya to True return karenge
-        # "🎥 **FileName**" format hum use kar rahe hain, wahi search karenge
-        query = f"🎥 **{file_name}**"
-        async for message in client.search_messages(chat_id, query=query, limit=1):
-            return True
-    except:
+        # 1. Clean Search: Sirf filename search karenge, koi emoji ya star (*) nahi.
+        # Telegram search exact words match karta hai.
+        query = file_name
+        
+        # 2. Limit 5 messages check karenge (Safety ke liye)
+        async for message in client.search_messages(chat_id, query=query, limit=5):
+            
+            # 3. Double Check: Kya sach me filename caption me hai?
+            if message.caption and file_name in message.caption:
+                return True
+            
+            # 4. Check File Attributes (Agar caption edit ho gya ho to)
+            if message.document and message.document.file_name == file_name:
+                return True
+            if message.video and message.video.file_name == file_name:
+                return True
+                
+    except Exception as e:
+        print(f"Search Error: {e}")
         return False
+        
     return False
 
 # --- GOOGLE DRIVE & DOWNLOAD ---
@@ -160,31 +172,23 @@ def get_file_id_from_url(url):
     elif "/d/" in url: return url.split("/d/")[1].split("/")[0]
     return url
 
-# Problem 1 & 4 Fix: Async Download Loop
 async def download_file_gdrive(service, file_id, original_name, message):
     temp_filename = f"temp_{file_id}" 
     file_path = f"./{temp_filename}"
     
-    # Run API calls in thread
     request = await asyncio.to_thread(service.files().get_media, fileId=file_id)
     file_metadata = await asyncio.to_thread(service.files().get(fileId=file_id, fields="size").execute)
     total_size = int(file_metadata.get('size', 0))
     start_time = time.time()
     
-    # Open file in blocking mode but write inside thread logic
     with open(file_path, "wb") as fh:
-        downloader = MediaIoBaseDownload(fh, request, chunksize=10 * 1024 * 1024) # Reduced chunk size for safety
+        downloader = MediaIoBaseDownload(fh, request, chunksize=10 * 1024 * 1024)
         done = False
         while done is False:
             if STOP_PROCESS: raise Exception("Stopped by User")
-            
-            # CRITICAL FIX: Run next_chunk in thread to prevent blocking event loop
-            # This enables Progress Bar to update and prevents stalling
             status, done = await asyncio.to_thread(downloader.next_chunk)
-            
             if status:
                 await progress(int(status.resumable_progress), total_size, message, start_time, f"⬇️ **Downloading:**\n`{original_name}`")
-                
     return file_path
 
 # --- UPLOAD ---
@@ -250,7 +254,7 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
             full_folder_name = f"📂 {parent_path}{original_name}"
             sent_msg = await client.send_message(chat_id, f"**{full_folder_name}**")
             
-            # Problem 2 Fix: Only Pin if it's the Root Selection (passed from handle_inputs)
+            # PIN logic: Only if it is Root Selection
             if is_root_selection:
                 try: await client.pin_chat_message(chat_id, sent_msg.id)
                 except: pass
@@ -259,17 +263,17 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
             msg_link = f"https://t.me/c/{clean_cid}/{sent_msg.id}"
             FOLDER_INDEX.append(f"[{original_name}]({msg_link})")
 
-            # Recursive call (is_root_selection False pass karenge taaki subfolder pin na ho)
             await recursive_process(client, service, file_id, user_id, message, parent_path + original_name + " / ", is_root_selection=False)
         else:
-            # Problem 3 Fix: Resume Capability
-            # Check if file already exists in channel
-            await message.edit(f"🔎 **Checking:** {original_name}...")
+            # Check Resume
+            await message.edit(f"🔎 **Checking:** `{original_name}`...")
+            # Use raw original name for search
             exists = await check_file_in_channel(client, chat_id, original_name)
             
             if exists:
-                await message.reply_text(f"✅ **Skipped (Exists):** {original_name}")
-                continue # Skip download/upload
+                # Agar mil gyi to skip karo
+                # await message.reply_text(f"✅ **Found:** {original_name} (Skipping)")
+                continue 
             
             msg = await message.reply_text(f"⏳ **Queued:** {original_name}")
             try:
@@ -306,9 +310,8 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
                 if os.path.exists(f"./temp_{file_id}"): os.remove(f"./temp_{file_id}")
                 await msg.delete()
 
-# --- COMMANDS & HANDLERS ---
+# --- COMMANDS ---
 
-# Problem 5 Fix: Auto Set Commands on Start
 async def set_commands(client):
     commands = [
         BotCommand("start", "Start Bot"),
@@ -340,9 +343,7 @@ async def stop_cmd(client, message):
 
 @bot.on_message(filters.command("start") & filters.private)
 async def start(client, message):
-    # Auto Set Commands
     await set_commands(client)
-    
     user_data[message.from_user.id] = {'step': 'idle'}
     config = load_config()
     if not config.get("channel_id"):
@@ -415,14 +416,13 @@ async def handle_inputs(client, message):
 
         for name, fid in valid_folders:
             if STOP_PROCESS: break
-            # Pass is_root_selection=True ONLY here so only these get pinned
+            # Pin only the Root Selection (Problem 2 Solved)
             await recursive_process(client, service, fid, uid, progress_msg, parent_path="", is_root_selection=True)
         
         if not STOP_PROCESS:
             if FOLDER_INDEX:
                 index_text = "📑 **Index:**\n\n" + "\n".join(FOLDER_INDEX)
                 if len(index_text) > 4000: index_text = index_text[:4000] + "..."
-                config = load_config()
                 await client.send_message(config.get("channel_id"), index_text)
             await message.reply_text("✅ **All Selected Tasks Completed!**")
         
