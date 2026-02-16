@@ -3,12 +3,13 @@ import time
 import math
 import asyncio
 import shutil
-from pyrogram import Client, filters
+from aiohttp import web  # Web Server ke liye
+from pyrogram import Client, filters, idle # idle import kiya
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-# --- CONFIGURATION FROM ENV VARIABLES ---
+# --- CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -25,11 +26,9 @@ SERVICE_ACCOUNT_FILE = 'credentials.json'
 # --- INITIALIZE BOT ---
 bot = Client("render_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# User State Data
 user_data = {}
 
 # --- HELPER FUNCTIONS ---
-
 def humanbytes(size):
     if not size: return ""
     power = 2**10
@@ -69,14 +68,12 @@ async def progress(current, total, message, start_time, status_text):
             f"📦 **Size:** {humanbytes(current)} / {humanbytes(total)}\n" + \
             f"🚀 **Speed:** {humanbytes(speed)}/s\n" + \
             f"⏱ **ETA:** {time_formatter(time_to_completion)}"
-            
         try:
             await message.edit(tmp)
         except:
             pass
 
 # --- GOOGLE DRIVE FUNCTIONS ---
-
 def get_gdrive_service():
     creds = service_account.Credentials.from_service_account_file(
         SERVICE_ACCOUNT_FILE, scopes=SCOPES)
@@ -91,14 +88,10 @@ def get_file_id_from_url(url):
 async def download_file_gdrive(service, file_id, file_name, message):
     request = service.files().get_media(fileId=file_id)
     file_path = f"./{file_name}"
-    
-    # Get Size
     file_metadata = service.files().get(fileId=file_id, fields="size").execute()
     total_size = int(file_metadata.get('size', 0))
-    
     start_time = time.time()
     
-    # High Speed Download (50MB Chunk)
     with open(file_path, "wb") as fh:
         downloader = MediaIoBaseDownload(fh, request, chunksize=50 * 1024 * 1024)
         done = False
@@ -106,11 +99,9 @@ async def download_file_gdrive(service, file_id, file_name, message):
             status, done = downloader.next_chunk()
             if status:
                 await progress(int(status.resumable_progress), total_size, message, start_time, f"⬇️ **Downloading:** {file_name}")
-                
     return file_path
 
-# --- UPLOAD & SPLIT LOGIC ---
-
+# --- UPLOAD & SPLIT ---
 async def upload_file(client, file_path, file_name, chat_id, caption, message, is_part=False):
     start_time = time.time()
     status_text = f"⬆️ **Uploading:** {file_name}"
@@ -137,7 +128,6 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
     custom_caption = user_data[user_id]['caption']
     
     query = f"'{folder_id}' in parents and trashed = false"
-    # Files ko Name se sort karke laana
     results = service.files().list(q=query, orderBy="name", fields="nextPageToken, files(id, name, mimeType)").execute()
     items = results.get('files', [])
 
@@ -150,18 +140,14 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
 
         if mime_type == 'application/vnd.google-apps.folder':
             await client.send_message(chat_id, f"📂 **{parent_path}{file_name}**")
-            # Subfolder me jana
             await recursive_process(client, service, file_id, user_id, message, parent_path + file_name + " / ")
         else:
             try:
                 msg = await message.reply_text(f"⏳ **Queued:** {file_name}")
-                
-                # Download
                 file_path = await download_file_gdrive(service, file_id, file_name, msg)
                 
                 final_caption = file_name if custom_caption == "SKIP" else f"{custom_caption}\n\n{file_name}"
                 
-                # Check Size for Split (1.9 GB Limit)
                 f_size = os.path.getsize(file_path)
                 LIMIT = 1.9 * 1024 * 1024 * 1024 
                 
@@ -174,67 +160,80 @@ async def recursive_process(client, service, folder_id, user_id, message, parent
                         while True:
                             chunk = f.read(int(LIMIT))
                             if not chunk: break
-                            
                             part_name = f"{file_name}.part{part_num}"
                             part_path = f"./{part_name}"
                             with open(part_path, 'wb') as p: p.write(chunk)
-                            
                             part_caption = f"{final_caption}\n\n**Part {part_num}**"
                             await upload_file(client, part_path, part_name, chat_id, part_caption, msg, is_part=True)
-                            
                             os.remove(part_path)
                             part_num += 1
 
-                # Cleanup
                 if os.path.exists(file_path): os.remove(file_path)
                 await msg.delete()
-                
             except Exception as e:
                 await client.send_message(user_id, f"❌ Error: {str(e)}")
 
 # --- COMMANDS ---
-
 @bot.on_message(filters.command("start") & filters.private)
 async def start(client, message):
     user_data[message.from_user.id] = {'step': 'ask_channel'}
-    await message.reply_text(
-        "👋 **Google Drive to Telegram Bot**\n\n"
-        "1. Send Target Channel ID (e.g., `-100xxxx`).\n"
-        "(Make sure I am Admin there)."
-    )
+    await message.reply_text("👋 **Drive to Telegram**\n\n1. Send Target Channel ID (e.g., `-100xxxx`).")
 
 @bot.on_message(filters.text & filters.private)
 async def handle_inputs(client, message):
     uid = message.from_user.id
     text = message.text.strip()
-    
-    if uid not in user_data: return await message.reply_text("Please /start first.")
+    if uid not in user_data: return await message.reply_text("/start first.")
     step = user_data[uid].get('step')
 
     if step == 'ask_channel':
         if text.startswith("-100"):
             user_data[uid]['channel_id'] = int(text)
             user_data[uid]['step'] = 'ask_caption'
-            await message.reply_text("✅ Channel Set.\n\n2. Send **Custom Caption** (or `SKIP`).")
+            await message.reply_text("✅ Channel Set.\n\n2. Send **Caption** (or `SKIP`).")
         else:
-            await message.reply_text("❌ Invalid ID. It must start with -100...")
-
+            await message.reply_text("❌ Invalid ID.")
     elif step == 'ask_caption':
         user_data[uid]['caption'] = text
         user_data[uid]['step'] = 'ask_link'
-        await message.reply_text("✅ Caption Set.\n\n3. Send **Google Drive Link**.")
-
+        await message.reply_text("✅ Caption Set.\n\n3. Send **Drive Link**.")
     elif step == 'ask_link':
         try:
             folder_id = get_file_id_from_url(text)
             service = get_gdrive_service()
-            await message.reply_text(f"🚀 **Processing Started...**\nSit back and relax!")
+            await message.reply_text(f"🚀 **Processing Started...**")
             await recursive_process(client, service, folder_id, uid, message)
-            await message.reply_text("✅ **All Files Uploaded Successfully!**")
+            await message.reply_text("✅ **Done!**")
             del user_data[uid]
         except Exception as e:
             await message.reply_text(f"Error: {e}")
 
-if __name__ == "__main__":
+# --- WEB SERVER & MAIN LOOP (FIX FOR RENDER) ---
+async def web_server():
+    async def handle(request):
+        return web.Response(text="Bot is running!")
+
+    app = web.Application()
+    app.add_routes([web.get('/', handle)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Render provides PORT variable
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Web Server started on port {port}")
+
+async def main():
+    # Start Web Server for Render
+    await web_server()
+    # Start Bot
+    await bot.start()
     print("Bot Started...")
-    bot.run()
+    # Keep running
+    await idle()
+    await bot.stop()
+
+if __name__ == "__main__":
+    # Naya tarikha loop run karne ka
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
