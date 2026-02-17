@@ -7,7 +7,7 @@ import re
 import json
 import subprocess
 import google.auth.transport.requests
-from aiohttp import web
+from aiohttp import web, ClientSession # <-- ClientSession add kiya
 from pyrogram import Client, filters, idle
 from pyrogram.types import BotCommand
 from google.oauth2 import service_account
@@ -18,6 +18,7 @@ API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CREDENTIALS_JSON = os.environ.get("GDRIVE_CREDENTIALS_JSON")
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL") # <-- Render URL automatic lega
 
 if CREDENTIALS_JSON:
     with open("credentials.json", "w") as f:
@@ -137,17 +138,7 @@ async def count_total_files(service, folder_id):
         if not page_token: break
     return total
 
-async def check_file_in_channel(client, chat_id, file_name):
-    try:
-        query = file_name
-        async for message in client.search_messages(chat_id, query=query, limit=5):
-            if message.caption and file_name in message.caption: return True
-            if message.document and message.document.file_name == file_name: return True
-            if message.video and message.video.file_name == file_name: return True
-    except: return False
-    return False
-
-# --- GOOGLE DRIVE & ARIA2 ---
+# --- GOOGLE DRIVE FUNCTIONS ---
 def get_gdrive_service():
     creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
     return build('drive', 'v3', credentials=creds), creds
@@ -158,6 +149,7 @@ def get_file_id_from_url(url):
     elif "/d/" in url: return url.split("/d/")[1].split("/")[0]
     return url
 
+# --- 🚀 ARIA2C DOWNLOADER ---
 async def download_with_aria2(file_id, original_name, message, creds):
     temp_filename = f"temp_{file_id}" 
     file_path = f"./{temp_filename}"
@@ -170,10 +162,14 @@ async def download_with_aria2(file_id, original_name, message, creds):
     start_time = time.time()
     await message.edit(f"⬇️ **Starting Aria2c:**\n`{original_name}`")
 
+    # Fixed: Added --max-tries=0 for infinite retries on network error
     cmd = [
-        "aria2c", f"--header=Authorization: Bearer {token}",
+        "aria2c", 
+        f"--header=Authorization: Bearer {token}",
         "-x16", "-s16", "-j16", "-k1M",
-        "--out", temp_filename, download_url
+        "--max-tries=0", "--retry-wait=3", # <-- New: Network fix
+        "--out", temp_filename,
+        download_url
     ]
 
     process = await asyncio.create_subprocess_exec(
@@ -191,9 +187,9 @@ async def download_with_aria2(file_id, original_name, message, creds):
                 try:
                     speed = current_size / (time.time() - start_time)
                     await message.edit(
-                        f"⬇️ **Downloading:**\n`{original_name}`\n\n"
+                        f"⬇️ **Downloading (Aria2c High Speed):**\n`{original_name}`\n\n"
                         f"📦 **Downloaded:** {humanbytes(current_size)}\n"
-                        f"🚀 **Speed:** {humanbytes(speed)}/s"
+                        f"🚀 **Avg Speed:** {humanbytes(speed)}/s"
                     )
                 except: pass
         
@@ -242,7 +238,7 @@ async def upload_file(client, file_path, display_name, chat_id, caption, message
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
 
 # --- RECURSIVE CORE ---
-async def recursive_process(client, service, creds, folder_id, user_id, message, parent_path=""):
+async def recursive_process(client, service, creds, folder_id, user_id, message, parent_path="", is_root_selection=False):
     global STOP_PROCESS, FOLDER_INDEX, SKIP_UNTIL_NAME, FOUND_START_FILE
     if STOP_PROCESS: return
 
@@ -267,64 +263,51 @@ async def recursive_process(client, service, creds, folder_id, user_id, message,
             if mime_type == 'application/vnd.google-apps.folder': pass 
             else:
                 if original_name.strip() == SKIP_UNTIL_NAME.strip():
-                    FOUND_START_FILE = True
-                    await client.send_message(user_id, f"✅ **Resuming Download:** {original_name}")
+                    FOUND_START_FILE = True 
+                    await client.send_message(user_id, f"✅ **Found Start Point:** {original_name}\nResuming Download...")
                 else: continue
 
         if mime_type == 'application/vnd.google-apps.folder':
             full_folder_name = f"📂 {parent_path}{original_name}"
-            
-            # Sub-Folders ke liye message bhejo, but PIN MAT KARO
             if not SKIP_UNTIL_NAME or FOUND_START_FILE:
                 sent_msg = await client.send_message(chat_id, f"**{full_folder_name}**")
+                
+                if is_root_selection:
+                    try: await client.pin_chat_message(chat_id, sent_msg.id)
+                    except: pass
                 
                 clean_cid = str(chat_id).replace("-100", "")
                 msg_link = f"https://t.me/c/{clean_cid}/{sent_msg.id}"
                 FOLDER_INDEX.append(f"[{original_name}]({msg_link})")
 
-            await recursive_process(client, service, creds, file_id, user_id, message, parent_path + original_name + " / ")
+            await recursive_process(client, service, creds, file_id, user_id, message, parent_path + original_name + " / ", is_root_selection=False)
         else:
-            if SKIP_UNTIL_NAME and not FOUND_START_FILE: continue 
+            if SKIP_UNTIL_NAME and not FOUND_START_FILE: continue
 
             msg = await message.reply_text(f"⏳ **Queued:** {original_name}")
             try:
                 temp_path = await download_with_aria2(file_id, original_name, msg, creds)
                 
                 final_caption = (f"📂 {parent_path}\n🎥 **{original_name}**")
-                
-                # Low RAM Splitting
+
                 f_size = os.path.getsize(temp_path)
                 LIMIT = 1.9 * 1024 * 1024 * 1024 
-                CHUNK_SIZE = 10 * 1024 * 1024 
                 
                 if f_size <= LIMIT:
                     await upload_file(client, temp_path, original_name, chat_id, final_caption, msg)
                 else:
                     await msg.edit(f"✂️ **Splitting File:** {humanbytes(f_size)}")
                     part_num = 1
-                    
                     with open(temp_path, 'rb') as f:
                         while True:
                             if STOP_PROCESS: raise Exception("Stopped")
-                            
+                            chunk = f.read(int(LIMIT))
+                            if not chunk: break
                             part_temp = f"{temp_path}_part{part_num}"
                             part_name = f"{original_name}.part{part_num}"
-                            current_part_size = 0
-                            
-                            with open(part_temp, 'wb') as p:
-                                while current_part_size < LIMIT:
-                                    chunk = f.read(CHUNK_SIZE)
-                                    if not chunk: break
-                                    p.write(chunk)
-                                    current_part_size += len(chunk)
-                            
-                            if os.path.getsize(part_temp) == 0:
-                                os.remove(part_temp)
-                                break
-                                
+                            with open(part_temp, 'wb') as p: p.write(chunk)
                             p_cap = f"{final_caption}\n\n**Part {part_num}**"
                             await upload_file(client, part_temp, part_name, chat_id, p_cap, msg, is_part=True)
-                            
                             if os.path.exists(part_temp): os.remove(part_temp)
                             part_num += 1
 
@@ -341,8 +324,8 @@ async def recursive_process(client, service, creds, folder_id, user_id, message,
 async def set_commands(client):
     commands = [
         BotCommand("start", "Start Bot"),
-        BotCommand("setchannel", "Set Channel"),
-        BotCommand("stop", "Stop"),
+        BotCommand("setchannel", "Set Target Channel"),
+        BotCommand("stop", "Stop Process"),
         BotCommand("removeid", "Remove Channel ID")
     ]
     await client.set_bot_commands(commands)
@@ -428,18 +411,13 @@ async def handle_inputs(client, message):
                 valid_folders.append((clean_name, folder_map[clean_name]))
         
         if not valid_folders:
-            await message.reply_text("❌ No valid folder names found. Copy exactly from list.")
+            await message.reply_text("❌ No valid folder names found.")
             return
         
         user_data[uid]['valid_folders'] = valid_folders
         user_data[uid]['step'] = 'ask_start_file'
         
-        await message.reply_text(
-            f"✅ Selected {len(valid_folders)} folders.\n\n"
-            "❓ **Do you want to start from a specific file?**\n"
-            "- Send **File Name** to start from there.\n"
-            "- Send **NO** to download everything."
-        )
+        await message.reply_text("❓ **Start from specific file?**\n- Send **File Name**\n- Send **NO**")
 
     elif current_step == 'ask_start_file':
         start_from = text
@@ -464,34 +442,35 @@ async def handle_inputs(client, message):
         for name, fid in valid_folders:
             if STOP_PROCESS: break
             
-            # --- PINNING LOGIC MOVED HERE ---
             chat_id = load_config().get("channel_id")
-            
-            # 1. Send Main Folder Name
             sent_msg = await client.send_message(chat_id, f"📂 **{name}**")
-            
-            # 2. Pin IT
             try: await client.pin_chat_message(chat_id, sent_msg.id)
             except: pass
             
-            # 3. Add to Index
-            clean_cid = str(chat_id).replace("-100", "")
-            msg_link = f"https://t.me/c/{clean_cid}/{sent_msg.id}"
-            FOLDER_INDEX.append(f"[{name}]({msg_link})")
-
-            # 4. Start Recursion (is_root_selection hata diya gaya hai)
-            await recursive_process(client, service, creds, fid, uid, progress_msg, parent_path="")
+            await recursive_process(client, service, creds, fid, uid, progress_msg, parent_path="", is_root_selection=True)
         
         if not STOP_PROCESS:
             if FOLDER_INDEX:
                 index_text = "📑 **Index:**\n\n" + "\n".join(FOLDER_INDEX)
                 if len(index_text) > 4000: index_text = index_text[:4000] + "..."
                 await client.send_message(load_config().get("channel_id"), index_text)
-            await message.reply_text("✅ **All Selected Tasks Completed!**")
+            await message.reply_text("✅ **All Tasks Completed!**")
         
         user_data[uid] = {'step': 'idle'}
 
-# --- WEB SERVER ---
+# --- 🚀 AUTO-PING / KEEP-ALIVE ---
+async def ping_server():
+    while True:
+        await asyncio.sleep(600) # Every 10 Minutes
+        try:
+            url = os.environ.get("RENDER_EXTERNAL_URL")
+            if url:
+                async with ClientSession() as session:
+                    async with session.get(url) as resp:
+                        print(f"Pinged {url}: {resp.status}")
+        except Exception as e:
+            print(f"Ping Error: {e}")
+
 async def web_server():
     async def handle(request): return web.Response(text="Bot Running")
     app = web.Application()
@@ -504,6 +483,7 @@ async def web_server():
 
 async def main():
     await web_server()
+    asyncio.create_task(ping_server()) # Start Auto-Ping Background Task
     await bot.start()
     print("Bot Started...")
     await idle()
