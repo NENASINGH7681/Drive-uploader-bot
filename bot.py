@@ -34,8 +34,8 @@ bot = Client("aria2_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 user_data = {}
 STOP_PROCESS = False
 FOLDER_INDEX = []
-SKIP_UNTIL_NAME = None # Jaha se start karna hai
-FOUND_START_FILE = False # Flag ki file mili ya nahi
+SKIP_UNTIL_NAME = None 
+FOUND_START_FILE = False 
 
 # --- CONFIG MANAGEMENT ---
 def load_config():
@@ -137,7 +137,17 @@ async def count_total_files(service, folder_id):
         if not page_token: break
     return total
 
-# --- GOOGLE DRIVE FUNCTIONS ---
+async def check_file_in_channel(client, chat_id, file_name):
+    try:
+        query = file_name
+        async for message in client.search_messages(chat_id, query=query, limit=5):
+            if message.caption and file_name in message.caption: return True
+            if message.document and message.document.file_name == file_name: return True
+            if message.video and message.video.file_name == file_name: return True
+    except: return False
+    return False
+
+# --- GOOGLE DRIVE & ARIA2 ---
 def get_gdrive_service():
     creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
     return build('drive', 'v3', credentials=creds), creds
@@ -148,55 +158,42 @@ def get_file_id_from_url(url):
     elif "/d/" in url: return url.split("/d/")[1].split("/")[0]
     return url
 
-# --- 🚀 ARIA2C DOWNLOADER (Problem 4 Fixed) ---
 async def download_with_aria2(file_id, original_name, message, creds):
     temp_filename = f"temp_{file_id}" 
     file_path = f"./{temp_filename}"
     
-    # 1. Get Access Token for Aria2
     request = google.auth.transport.requests.Request()
     creds.refresh(request)
     token = creds.token
-    
-    # 2. Download URL
     download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
     
     start_time = time.time()
     await message.edit(f"⬇️ **Starting Aria2c:**\n`{original_name}`")
 
-    # 3. Run Aria2c command
-    # -x16: 16 Connections (Fast Speed)
-    # -s16: Split file into 16 parts
     cmd = [
-        "aria2c", 
-        f"--header=Authorization: Bearer {token}",
+        "aria2c", f"--header=Authorization: Bearer {token}",
         "-x16", "-s16", "-j16", "-k1M",
-        "--out", temp_filename,
-        download_url
+        "--out", temp_filename, download_url
     ]
 
     process = await asyncio.create_subprocess_exec(
         *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     
-    # Monitor Aria2 Progress (Simplified)
     while process.returncode is None:
         if STOP_PROCESS:
             process.terminate()
             raise Exception("Stopped by User")
         
-        # Check if file exists and update simple progress
         if os.path.exists(file_path):
             current_size = os.path.getsize(file_path)
-            # Total size hume pata nahi hota aria2 stream me easily, 
-            # to bas downloaded size dikhayenge
             if current_size > 0 and time.time() - start_time > 3:
                 try:
                     speed = current_size / (time.time() - start_time)
                     await message.edit(
-                        f"⬇️ **Downloading (Aria2c High Speed):**\n`{original_name}`\n\n"
+                        f"⬇️ **Downloading:**\n`{original_name}`\n\n"
                         f"📦 **Downloaded:** {humanbytes(current_size)}\n"
-                        f"🚀 **Avg Speed:** {humanbytes(speed)}/s"
+                        f"🚀 **Speed:** {humanbytes(speed)}/s"
                     )
                 except: pass
         
@@ -204,10 +201,7 @@ async def download_with_aria2(file_id, original_name, message, creds):
         if process.returncode is not None: break
 
     await process.wait()
-    
-    if process.returncode != 0:
-        raise Exception("Aria2c Download Failed")
-
+    if process.returncode != 0: raise Exception("Aria2c Download Failed")
     return file_path
 
 # --- UPLOAD ---
@@ -247,8 +241,8 @@ async def upload_file(client, file_path, display_name, chat_id, caption, message
     finally:
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
 
-# --- RECURSIVE CORE (Problem 3: Start From File Logic) ---
-async def recursive_process(client, service, creds, folder_id, user_id, message, parent_path=""):
+# --- RECURSIVE CORE ---
+async def recursive_process(client, service, creds, folder_id, user_id, message, parent_path="", is_root_selection=False):
     global STOP_PROCESS, FOLDER_INDEX, SKIP_UNTIL_NAME, FOUND_START_FILE
     if STOP_PROCESS: return
 
@@ -269,63 +263,74 @@ async def recursive_process(client, service, creds, folder_id, user_id, message,
         file_id = item['id']
         mime_type = item['mimeType']
 
-        # --- SKIPPING LOGIC ---
-        # Agar "Start From" set hai aur abhi tak file nahi mili, to check karo
         if SKIP_UNTIL_NAME and not FOUND_START_FILE:
-            # Agar ye folder hai, to iske andar jaake dekhna padega
-            if mime_type == 'application/vnd.google-apps.folder':
-                 # Folder ke andar search jari rakho
-                 pass 
-            # Agar ye file hai
+            if mime_type == 'application/vnd.google-apps.folder': pass 
             else:
                 if original_name.strip() == SKIP_UNTIL_NAME.strip():
-                    FOUND_START_FILE = True # Mil gayi! Ab yahan se download shuru
-                    await client.send_message(user_id, f"✅ **Found Start Point:** {original_name}\nResuming Download...")
-                else:
-                    # Match nahi hua, skip karo
-                    continue
+                    FOUND_START_FILE = True
+                    await client.send_message(user_id, f"✅ **Resuming Download:** {original_name}")
+                else: continue
 
         if mime_type == 'application/vnd.google-apps.folder':
             full_folder_name = f"📂 {parent_path}{original_name}"
             
-            # Agar file mil chuki hai ya hum skip mode me nahi hain, tabhi folder message bhejo
             if not SKIP_UNTIL_NAME or FOUND_START_FILE:
                 sent_msg = await client.send_message(chat_id, f"**{full_folder_name}**")
+                
+                # PIN ONLY ROOT SELECTION
+                if is_root_selection:
+                    try: await client.pin_chat_message(chat_id, sent_msg.id)
+                    except: pass
+
                 clean_cid = str(chat_id).replace("-100", "")
                 msg_link = f"https://t.me/c/{clean_cid}/{sent_msg.id}"
                 FOLDER_INDEX.append(f"[{original_name}]({msg_link})")
 
-            # Recursion
-            await recursive_process(client, service, creds, file_id, user_id, message, parent_path + original_name + " / ")
+            await recursive_process(client, service, creds, file_id, user_id, message, parent_path + original_name + " / ", is_root_selection=False)
         else:
-            # File Processing
-            if SKIP_UNTIL_NAME and not FOUND_START_FILE: continue # Extra safety
+            if SKIP_UNTIL_NAME and not FOUND_START_FILE: continue 
 
             msg = await message.reply_text(f"⏳ **Queued:** {original_name}")
             try:
-                # Use Aria2c here
                 temp_path = await download_with_aria2(file_id, original_name, msg, creds)
                 
                 final_caption = (f"📂 {parent_path}\n🎥 **{original_name}**")
-
+                
+                # --- RAM SAFE SPLITTING ---
                 f_size = os.path.getsize(temp_path)
                 LIMIT = 1.9 * 1024 * 1024 * 1024 
+                CHUNK_SIZE = 10 * 1024 * 1024 # 10MB Chunks to save RAM
                 
                 if f_size <= LIMIT:
                     await upload_file(client, temp_path, original_name, chat_id, final_caption, msg)
                 else:
                     await msg.edit(f"✂️ **Splitting File:** {humanbytes(f_size)}")
                     part_num = 1
+                    
                     with open(temp_path, 'rb') as f:
                         while True:
                             if STOP_PROCESS: raise Exception("Stopped")
-                            chunk = f.read(int(LIMIT))
-                            if not chunk: break
+                            
                             part_temp = f"{temp_path}_part{part_num}"
                             part_name = f"{original_name}.part{part_num}"
-                            with open(part_temp, 'wb') as p: p.write(chunk)
+                            current_part_size = 0
+                            
+                            # Streaming Write (Low RAM)
+                            with open(part_temp, 'wb') as p:
+                                while current_part_size < LIMIT:
+                                    chunk = f.read(CHUNK_SIZE)
+                                    if not chunk: break
+                                    p.write(chunk)
+                                    current_part_size += len(chunk)
+                            
+                            # If part is empty (EOF), delete and break
+                            if os.path.getsize(part_temp) == 0:
+                                os.remove(part_temp)
+                                break
+                                
                             p_cap = f"{final_caption}\n\n**Part {part_num}**"
                             await upload_file(client, part_temp, part_name, chat_id, p_cap, msg, is_part=True)
+                            
                             if os.path.exists(part_temp): os.remove(part_temp)
                             part_num += 1
 
@@ -342,8 +347,8 @@ async def recursive_process(client, service, creds, folder_id, user_id, message,
 async def set_commands(client):
     commands = [
         BotCommand("start", "Start Bot"),
-        BotCommand("setchannel", "Set Target Channel"),
-        BotCommand("stop", "Stop Process"),
+        BotCommand("setchannel", "Set Channel"),
+        BotCommand("stop", "Stop"),
         BotCommand("removeid", "Remove Channel ID")
     ]
     await client.set_bot_commands(commands)
@@ -390,11 +395,10 @@ async def handle_inputs(client, message):
 
     current_step = user_data.get(uid, {}).get('step', 'idle')
 
-    # STEP 1: Link -> Show Folders
     if current_step == 'idle' or "drive.google.com" in text:
         try:
             folder_id = get_file_id_from_url(text)
-            service, creds = get_gdrive_service() # Get creds too
+            service, creds = get_gdrive_service()
             msg = await message.reply_text("🔍 **Scanning for folders...**")
             
             query = f"'{folder_id}' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder'"
@@ -419,7 +423,6 @@ async def handle_inputs(client, message):
         except Exception as e:
             await message.reply_text(f"❌ Error: {e}")
 
-    # STEP 2: Handle Selection -> Ask Start File
     elif current_step == 'ask_selection':
         folder_map = user_data[uid].get('folder_map', {})
         selected_names = text.split('\n')
@@ -434,7 +437,6 @@ async def handle_inputs(client, message):
             await message.reply_text("❌ No valid folder names found. Copy exactly from list.")
             return
         
-        # Save Selection and move to next step
         user_data[uid]['valid_folders'] = valid_folders
         user_data[uid]['step'] = 'ask_start_file'
         
@@ -445,7 +447,6 @@ async def handle_inputs(client, message):
             "- Send **NO** to download everything."
         )
 
-    # STEP 3: Handle Start File -> Start Process
     elif current_step == 'ask_start_file':
         start_from = text
         valid_folders = user_data[uid]['valid_folders']
@@ -454,37 +455,28 @@ async def handle_inputs(client, message):
         STOP_PROCESS = False
         FOLDER_INDEX = []
         
-        # Logic for Skip
         if start_from.upper() == "NO":
             SKIP_UNTIL_NAME = None
-            FOUND_START_FILE = True # Treat as found immediately
+            FOUND_START_FILE = True 
             await message.reply_text("🚀 **Starting Full Download...**")
         else:
             SKIP_UNTIL_NAME = start_from
             FOUND_START_FILE = False
-            await message.reply_text(f"🚀 **Searching for '{start_from}' to start...**")
+            await message.reply_text(f"🚀 **Searching for '{start_from}'...**")
 
         service, creds = get_gdrive_service()
         progress_msg = await message.reply_text("⚙️ **Initializing Aria2c...**")
 
         for name, fid in valid_folders:
             if STOP_PROCESS: break
-            
-            # Problem 2 Solved: Pin ONLY Main Folder Name Here
-            chat_id = load_config().get("channel_id")
-            sent_msg = await client.send_message(chat_id, f"📂 **{name}**")
-            try: await client.pin_chat_message(chat_id, sent_msg.id)
-            except: pass
-            
-            # Start Recursion
-            await recursive_process(client, service, creds, fid, uid, progress_msg, parent_path="")
+            await recursive_process(client, service, creds, fid, uid, progress_msg, parent_path="", is_root_selection=True)
         
         if not STOP_PROCESS:
             if FOLDER_INDEX:
                 index_text = "📑 **Index:**\n\n" + "\n".join(FOLDER_INDEX)
                 if len(index_text) > 4000: index_text = index_text[:4000] + "..."
                 await client.send_message(load_config().get("channel_id"), index_text)
-            await message.reply_text("✅ **All Tasks Completed!**")
+            await message.reply_text("✅ **All Selected Tasks Completed!**")
         
         user_data[uid] = {'step': 'idle'}
 
