@@ -242,7 +242,7 @@ async def upload_file(client, file_path, display_name, chat_id, caption, message
         if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
 
 # --- RECURSIVE CORE ---
-async def recursive_process(client, service, creds, folder_id, user_id, message, parent_path="", is_root_selection=False):
+async def recursive_process(client, service, creds, folder_id, user_id, message, parent_path=""):
     global STOP_PROCESS, FOLDER_INDEX, SKIP_UNTIL_NAME, FOUND_START_FILE
     if STOP_PROCESS: return
 
@@ -274,19 +274,15 @@ async def recursive_process(client, service, creds, folder_id, user_id, message,
         if mime_type == 'application/vnd.google-apps.folder':
             full_folder_name = f"📂 {parent_path}{original_name}"
             
+            # Sub-Folders ke liye message bhejo, but PIN MAT KARO
             if not SKIP_UNTIL_NAME or FOUND_START_FILE:
                 sent_msg = await client.send_message(chat_id, f"**{full_folder_name}**")
                 
-                # PIN ONLY ROOT SELECTION
-                if is_root_selection:
-                    try: await client.pin_chat_message(chat_id, sent_msg.id)
-                    except: pass
-
                 clean_cid = str(chat_id).replace("-100", "")
                 msg_link = f"https://t.me/c/{clean_cid}/{sent_msg.id}"
                 FOLDER_INDEX.append(f"[{original_name}]({msg_link})")
 
-            await recursive_process(client, service, creds, file_id, user_id, message, parent_path + original_name + " / ", is_root_selection=False)
+            await recursive_process(client, service, creds, file_id, user_id, message, parent_path + original_name + " / ")
         else:
             if SKIP_UNTIL_NAME and not FOUND_START_FILE: continue 
 
@@ -296,10 +292,10 @@ async def recursive_process(client, service, creds, folder_id, user_id, message,
                 
                 final_caption = (f"📂 {parent_path}\n🎥 **{original_name}**")
                 
-                # --- RAM SAFE SPLITTING ---
+                # Low RAM Splitting
                 f_size = os.path.getsize(temp_path)
                 LIMIT = 1.9 * 1024 * 1024 * 1024 
-                CHUNK_SIZE = 10 * 1024 * 1024 # 10MB Chunks to save RAM
+                CHUNK_SIZE = 10 * 1024 * 1024 
                 
                 if f_size <= LIMIT:
                     await upload_file(client, temp_path, original_name, chat_id, final_caption, msg)
@@ -315,7 +311,6 @@ async def recursive_process(client, service, creds, folder_id, user_id, message,
                             part_name = f"{original_name}.part{part_num}"
                             current_part_size = 0
                             
-                            # Streaming Write (Low RAM)
                             with open(part_temp, 'wb') as p:
                                 while current_part_size < LIMIT:
                                     chunk = f.read(CHUNK_SIZE)
@@ -323,7 +318,6 @@ async def recursive_process(client, service, creds, folder_id, user_id, message,
                                     p.write(chunk)
                                     current_part_size += len(chunk)
                             
-                            # If part is empty (EOF), delete and break
                             if os.path.getsize(part_temp) == 0:
                                 os.remove(part_temp)
                                 break
@@ -469,7 +463,24 @@ async def handle_inputs(client, message):
 
         for name, fid in valid_folders:
             if STOP_PROCESS: break
-            await recursive_process(client, service, creds, fid, uid, progress_msg, parent_path="", is_root_selection=True)
+            
+            # --- PINNING LOGIC MOVED HERE ---
+            chat_id = load_config().get("channel_id")
+            
+            # 1. Send Main Folder Name
+            sent_msg = await client.send_message(chat_id, f"📂 **{name}**")
+            
+            # 2. Pin IT
+            try: await client.pin_chat_message(chat_id, sent_msg.id)
+            except: pass
+            
+            # 3. Add to Index
+            clean_cid = str(chat_id).replace("-100", "")
+            msg_link = f"https://t.me/c/{clean_cid}/{sent_msg.id}"
+            FOLDER_INDEX.append(f"[{name}]({msg_link})")
+
+            # 4. Start Recursion (is_root_selection hata diya gaya hai)
+            await recursive_process(client, service, creds, fid, uid, progress_msg, parent_path="")
         
         if not STOP_PROCESS:
             if FOLDER_INDEX:
