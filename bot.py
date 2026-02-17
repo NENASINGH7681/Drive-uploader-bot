@@ -7,7 +7,7 @@ import re
 import json
 import subprocess
 import google.auth.transport.requests
-from aiohttp import web, ClientSession # <-- ClientSession add kiya
+from aiohttp import web
 from pyrogram import Client, filters, idle
 from pyrogram.types import BotCommand
 from google.oauth2 import service_account
@@ -18,7 +18,6 @@ API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CREDENTIALS_JSON = os.environ.get("GDRIVE_CREDENTIALS_JSON")
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL") # <-- Render URL automatic lega
 
 if CREDENTIALS_JSON:
     with open("credentials.json", "w") as f:
@@ -149,7 +148,7 @@ def get_file_id_from_url(url):
     elif "/d/" in url: return url.split("/d/")[1].split("/")[0]
     return url
 
-# --- 🚀 ARIA2C DOWNLOADER ---
+# --- 🚀 ARIA2C DOWNLOADER (OPTIMIZED FOR STABILITY) ---
 async def download_with_aria2(file_id, original_name, message, creds):
     temp_filename = f"temp_{file_id}" 
     file_path = f"./{temp_filename}"
@@ -160,14 +159,17 @@ async def download_with_aria2(file_id, original_name, message, creds):
     download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
     
     start_time = time.time()
-    await message.edit(f"⬇️ **Starting Aria2c:**\n`{original_name}`")
+    await message.edit(f"⬇️ **Starting Download...**\n`{original_name}`")
 
-    # Fixed: Added --max-tries=0 for infinite retries on network error
+    # FIX: Reduced connections to 8 (from 16) to prevent RAM Freeze
+    # Added timeout commands
     cmd = [
         "aria2c", 
         f"--header=Authorization: Bearer {token}",
-        "-x16", "-s16", "-j16", "-k1M",
-        "--max-tries=0", "--retry-wait=3", # <-- New: Network fix
+        "-x8", "-s8", "-j8", "-k1M", # <-- Optimized for Render Free Tier
+        "--connect-timeout=60",      # <-- Timeout if hangs
+        "--max-tries=5", 
+        "--retry-wait=3",
         "--out", temp_filename,
         download_url
     ]
@@ -176,20 +178,25 @@ async def download_with_aria2(file_id, original_name, message, creds):
         *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     
+    last_update_time = 0
+    
     while process.returncode is None:
         if STOP_PROCESS:
             process.terminate()
             raise Exception("Stopped by User")
         
+        # Check progress
         if os.path.exists(file_path):
             current_size = os.path.getsize(file_path)
-            if current_size > 0 and time.time() - start_time > 3:
+            now = time.time()
+            if current_size > 0 and (now - last_update_time) > 4: # Update every 4 sec
+                last_update_time = now
                 try:
-                    speed = current_size / (time.time() - start_time)
+                    speed = current_size / (now - start_time)
                     await message.edit(
-                        f"⬇️ **Downloading (Aria2c High Speed):**\n`{original_name}`\n\n"
+                        f"⬇️ **Downloading:**\n`{original_name}`\n\n"
                         f"📦 **Downloaded:** {humanbytes(current_size)}\n"
-                        f"🚀 **Avg Speed:** {humanbytes(speed)}/s"
+                        f"🚀 **Speed:** {humanbytes(speed)}/s"
                     )
                 except: pass
         
@@ -197,7 +204,7 @@ async def download_with_aria2(file_id, original_name, message, creds):
         if process.returncode is not None: break
 
     await process.wait()
-    if process.returncode != 0: raise Exception("Aria2c Download Failed")
+    if process.returncode != 0: raise Exception("Download Failed (Network/Space)")
     return file_path
 
 # --- UPLOAD ---
@@ -259,19 +266,27 @@ async def recursive_process(client, service, creds, folder_id, user_id, message,
         file_id = item['id']
         mime_type = item['mimeType']
 
+        # --- SKIP CHECK ---
+        # Agar hum file dhund rahe hain, aur ye match nahi karti
         if SKIP_UNTIL_NAME and not FOUND_START_FILE:
-            if mime_type == 'application/vnd.google-apps.folder': pass 
-            else:
+            # Agar ye file hai, to check karo match karti hai kya
+            if mime_type != 'application/vnd.google-apps.folder':
                 if original_name.strip() == SKIP_UNTIL_NAME.strip():
                     FOUND_START_FILE = True 
                     await client.send_message(user_id, f"✅ **Found Start Point:** {original_name}\nResuming Download...")
-                else: continue
+                else:
+                    # Match nahi hua, ignore karo
+                    continue
 
+        # --- FOLDER HANDLING ---
         if mime_type == 'application/vnd.google-apps.folder':
             full_folder_name = f"📂 {parent_path}{original_name}"
+            
+            # FIX: Only send/pin folder message IF we are actively downloading (File found or No Skip)
             if not SKIP_UNTIL_NAME or FOUND_START_FILE:
                 sent_msg = await client.send_message(chat_id, f"**{full_folder_name}**")
                 
+                # Pin ONLY if it's the Root Selection Folder
                 if is_root_selection:
                     try: await client.pin_chat_message(chat_id, sent_msg.id)
                     except: pass
@@ -280,8 +295,13 @@ async def recursive_process(client, service, creds, folder_id, user_id, message,
                 msg_link = f"https://t.me/c/{clean_cid}/{sent_msg.id}"
                 FOLDER_INDEX.append(f"[{original_name}]({msg_link})")
 
+            # Recursion (Agar skip kar rahe hain to folder me ghusna padega file dhundne ke liye)
+            # Lekin "is_root_selection" ko False kar denge taaki sub-folders pin na hon
             await recursive_process(client, service, creds, file_id, user_id, message, parent_path + original_name + " / ", is_root_selection=False)
+        
+        # --- FILE HANDLING ---
         else:
+            # Double check: Agar file milne se pehle yaha aa gye (folder traversal me), to continue
             if SKIP_UNTIL_NAME and not FOUND_START_FILE: continue
 
             msg = await message.reply_text(f"⏳ **Queued:** {original_name}")
@@ -442,10 +462,8 @@ async def handle_inputs(client, message):
         for name, fid in valid_folders:
             if STOP_PROCESS: break
             
-            chat_id = load_config().get("channel_id")
-            sent_msg = await client.send_message(chat_id, f"📂 **{name}**")
-            try: await client.pin_chat_message(chat_id, sent_msg.id)
-            except: pass
+            # PIN logic: Isko loop ke andar handle kiya hai ab taaki skip me na pin ho
+            # Hum yaha pin nahi karenge, recursive_process ke andar hi karenge
             
             await recursive_process(client, service, creds, fid, uid, progress_msg, parent_path="", is_root_selection=True)
         
@@ -458,19 +476,7 @@ async def handle_inputs(client, message):
         
         user_data[uid] = {'step': 'idle'}
 
-# --- 🚀 AUTO-PING / KEEP-ALIVE ---
-async def ping_server():
-    while True:
-        await asyncio.sleep(600) # Every 10 Minutes
-        try:
-            url = os.environ.get("RENDER_EXTERNAL_URL")
-            if url:
-                async with ClientSession() as session:
-                    async with session.get(url) as resp:
-                        print(f"Pinged {url}: {resp.status}")
-        except Exception as e:
-            print(f"Ping Error: {e}")
-
+# --- WEB SERVER ---
 async def web_server():
     async def handle(request): return web.Response(text="Bot Running")
     app = web.Application()
@@ -483,7 +489,6 @@ async def web_server():
 
 async def main():
     await web_server()
-    asyncio.create_task(ping_server()) # Start Auto-Ping Background Task
     await bot.start()
     print("Bot Started...")
     await idle()
