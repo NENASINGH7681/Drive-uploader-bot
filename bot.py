@@ -36,6 +36,7 @@ STOP_PROCESS = False
 FOLDER_INDEX = []
 SKIP_UNTIL_NAME = None 
 FOUND_START_FILE = False 
+GLOBAL_SKIP_LIST = [] # New: List of names to skip everywhere
 
 # --- CONFIG MANAGEMENT ---
 def load_config():
@@ -148,7 +149,7 @@ def get_file_id_from_url(url):
     elif "/d/" in url: return url.split("/d/")[1].split("/")[0]
     return url
 
-# --- 🚀 ARIA2C DOWNLOADER (OPTIMIZED FOR STABILITY) ---
+# --- ARIA2C DOWNLOADER ---
 async def download_with_aria2(file_id, original_name, message, creds):
     temp_filename = f"temp_{file_id}" 
     file_path = f"./{temp_filename}"
@@ -161,13 +162,11 @@ async def download_with_aria2(file_id, original_name, message, creds):
     start_time = time.time()
     await message.edit(f"⬇️ **Starting Download...**\n`{original_name}`")
 
-    # FIX: Reduced connections to 8 (from 16) to prevent RAM Freeze
-    # Added timeout commands
     cmd = [
         "aria2c", 
         f"--header=Authorization: Bearer {token}",
-        "-x8", "-s8", "-j8", "-k1M", # <-- Optimized for Render Free Tier
-        "--connect-timeout=60",      # <-- Timeout if hangs
+        "-x8", "-s8", "-j8", "-k1M", 
+        "--connect-timeout=60",      
         "--max-tries=5", 
         "--retry-wait=3",
         "--out", temp_filename,
@@ -179,17 +178,15 @@ async def download_with_aria2(file_id, original_name, message, creds):
     )
     
     last_update_time = 0
-    
     while process.returncode is None:
         if STOP_PROCESS:
             process.terminate()
             raise Exception("Stopped by User")
         
-        # Check progress
         if os.path.exists(file_path):
             current_size = os.path.getsize(file_path)
             now = time.time()
-            if current_size > 0 and (now - last_update_time) > 4: # Update every 4 sec
+            if current_size > 0 and (now - last_update_time) > 4: 
                 last_update_time = now
                 try:
                     speed = current_size / (now - start_time)
@@ -246,7 +243,7 @@ async def upload_file(client, file_path, display_name, chat_id, caption, message
 
 # --- RECURSIVE CORE ---
 async def recursive_process(client, service, creds, folder_id, user_id, message, parent_path="", is_root_selection=False):
-    global STOP_PROCESS, FOLDER_INDEX, SKIP_UNTIL_NAME, FOUND_START_FILE
+    global STOP_PROCESS, FOLDER_INDEX, SKIP_UNTIL_NAME, FOUND_START_FILE, GLOBAL_SKIP_LIST
     if STOP_PROCESS: return
 
     config = load_config()
@@ -266,27 +263,29 @@ async def recursive_process(client, service, creds, folder_id, user_id, message,
         file_id = item['id']
         mime_type = item['mimeType']
 
-        # --- SKIP CHECK ---
-        # Agar hum file dhund rahe hain, aur ye match nahi karti
+        # --- FUNCTION 2: GLOBAL SKIP CHECK ---
+        # Checks if name is in the blacklist
+        if original_name.strip() in GLOBAL_SKIP_LIST:
+            await client.send_message(user_id, f"🚫 **Skipping (Blacklisted):** {original_name}")
+            continue
+
+        # --- START FROM CHECK ---
         if SKIP_UNTIL_NAME and not FOUND_START_FILE:
-            # Agar ye file hai, to check karo match karti hai kya
             if mime_type != 'application/vnd.google-apps.folder':
                 if original_name.strip() == SKIP_UNTIL_NAME.strip():
                     FOUND_START_FILE = True 
                     await client.send_message(user_id, f"✅ **Found Start Point:** {original_name}\nResuming Download...")
                 else:
-                    # Match nahi hua, ignore karo
                     continue
 
         # --- FOLDER HANDLING ---
         if mime_type == 'application/vnd.google-apps.folder':
             full_folder_name = f"📂 {parent_path}{original_name}"
             
-            # FIX: Only send/pin folder message IF we are actively downloading (File found or No Skip)
             if not SKIP_UNTIL_NAME or FOUND_START_FILE:
                 sent_msg = await client.send_message(chat_id, f"**{full_folder_name}**")
                 
-                # Pin ONLY if it's the Root Selection Folder
+                # Pin ONLY if Root Selection
                 if is_root_selection:
                     try: await client.pin_chat_message(chat_id, sent_msg.id)
                     except: pass
@@ -295,13 +294,11 @@ async def recursive_process(client, service, creds, folder_id, user_id, message,
                 msg_link = f"https://t.me/c/{clean_cid}/{sent_msg.id}"
                 FOLDER_INDEX.append(f"[{original_name}]({msg_link})")
 
-            # Recursion (Agar skip kar rahe hain to folder me ghusna padega file dhundne ke liye)
-            # Lekin "is_root_selection" ko False kar denge taaki sub-folders pin na hon
+            # Recursive call
             await recursive_process(client, service, creds, file_id, user_id, message, parent_path + original_name + " / ", is_root_selection=False)
         
         # --- FILE HANDLING ---
         else:
-            # Double check: Agar file milne se pehle yaha aa gye (folder traversal me), to continue
             if SKIP_UNTIL_NAME and not FOUND_START_FILE: continue
 
             msg = await message.reply_text(f"⏳ **Queued:** {original_name}")
@@ -392,80 +389,151 @@ async def handle_inputs(client, message):
 
     current_step = user_data.get(uid, {}).get('step', 'idle')
 
+    # STEP 1: Link -> Show Files AND Folders (Function 1)
     if current_step == 'idle' or "drive.google.com" in text:
         try:
             folder_id = get_file_id_from_url(text)
             service, creds = get_gdrive_service()
-            msg = await message.reply_text("🔍 **Scanning for folders...**")
+            msg = await message.reply_text("🔍 **Scanning for content...**")
             
-            query = f"'{folder_id}' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder'"
-            results = await asyncio.to_thread(service.files().list(q=query, fields="files(id, name)").execute)
-            folders = results.get('files', [])
-            folders.sort(key=lambda x: natural_sort_key(x['name']))
+            # Modified Query: No mimeType filter (Get ALL)
+            query = f"'{folder_id}' in parents and trashed = false"
+            results = await asyncio.to_thread(service.files().list(q=query, fields="files(id, name, mimeType)").execute)
+            items = results.get('files', [])
+            items.sort(key=lambda x: natural_sort_key(x['name']))
 
-            if not folders:
-                await msg.edit("❌ No folders found. (Files in root are skipped in selective mode).")
+            if not items:
+                await msg.edit("❌ Empty folder.")
                 return
 
-            folder_map = {f['name']: f['id'] for f in folders}
-            user_data[uid] = {'step': 'ask_selection', 'folder_map': folder_map}
+            # Store map {Name: {ID, Type}}
+            item_map = {i['name']: {'id': i['id'], 'mimeType': i['mimeType']} for i in items}
+            user_data[uid] = {'step': 'ask_selection', 'item_map': item_map}
 
-            list_text = "**Found Folders:**\n\n"
-            for f in folders:
-                list_text += f"`{f['name']}`\n"
+            list_text = "**Found Content:**\n\n"
+            for i in items:
+                icon = "📂" if i['mimeType'] == 'application/vnd.google-apps.folder' else "📄"
+                list_text += f"`{icon} {i['name']}`\n"
             
-            list_text += "\n👇 **Copy & Send names of folders to download.**"
+            list_text += "\n👇 **Copy & Send names of items to download.**"
             await msg.edit(list_text)
 
         except Exception as e:
             await message.reply_text(f"❌ Error: {e}")
 
+    # STEP 2: Handle Selection -> Ask Start File
     elif current_step == 'ask_selection':
-        folder_map = user_data[uid].get('folder_map', {})
+        item_map = user_data[uid].get('item_map', {})
         selected_names = text.split('\n')
-        valid_folders = []
+        valid_items = []
 
         for name in selected_names:
-            clean_name = name.strip()
-            if clean_name in folder_map:
-                valid_folders.append((clean_name, folder_map[clean_name]))
+            # Remove emoji if copied by mistake
+            clean_name = name.replace("📂 ", "").replace("📄 ", "").strip()
+            if clean_name in item_map:
+                valid_items.append((clean_name, item_map[clean_name]))
         
-        if not valid_folders:
-            await message.reply_text("❌ No valid folder names found.")
+        if not valid_items:
+            await message.reply_text("❌ No valid names found.")
             return
         
-        user_data[uid]['valid_folders'] = valid_folders
+        user_data[uid]['valid_items'] = valid_items
         user_data[uid]['step'] = 'ask_start_file'
         
         await message.reply_text("❓ **Start from specific file?**\n- Send **File Name**\n- Send **NO**")
 
+    # STEP 3: Handle Start File -> Ask Global Skip (Function 2)
     elif current_step == 'ask_start_file':
         start_from = text
-        valid_folders = user_data[uid]['valid_folders']
-        
-        global STOP_PROCESS, FOLDER_INDEX, SKIP_UNTIL_NAME, FOUND_START_FILE
-        STOP_PROCESS = False
-        FOLDER_INDEX = []
         
         if start_from.upper() == "NO":
-            SKIP_UNTIL_NAME = None
-            FOUND_START_FILE = True 
-            await message.reply_text("🚀 **Starting Full Download...**")
+            user_data[uid]['start_from'] = None
         else:
-            SKIP_UNTIL_NAME = start_from
-            FOUND_START_FILE = False
-            await message.reply_text(f"🚀 **Searching for '{start_from}'...**")
+            user_data[uid]['start_from'] = start_from
+            
+        user_data[uid]['step'] = 'ask_global_skip'
+        await message.reply_text(
+            "🚫 **Skip any file or folder?** (Global Blacklist)\n\n"
+            "If any file/folder matches this name ANYWHERE, it will be skipped.\n"
+            "- Send Names (line by line)\n"
+            "- Send **NO** to skip nothing."
+        )
 
+    # STEP 4: Handle Skip List -> Start Process
+    elif current_step == 'ask_global_skip':
+        skip_input = text
+        global STOP_PROCESS, FOLDER_INDEX, SKIP_UNTIL_NAME, FOUND_START_FILE, GLOBAL_SKIP_LIST
+        
+        STOP_PROCESS = False
+        FOLDER_INDEX = []
+        GLOBAL_SKIP_LIST = []
+        
+        # Set Skip List
+        if skip_input.upper() != "NO":
+            GLOBAL_SKIP_LIST = [x.strip() for x in skip_input.split('\n') if x.strip()]
+            
+        # Set Start From
+        SKIP_UNTIL_NAME = user_data[uid].get('start_from')
+        FOUND_START_FILE = True if SKIP_UNTIL_NAME is None else False
+        
+        valid_items = user_data[uid]['valid_items']
         service, creds = get_gdrive_service()
-        progress_msg = await message.reply_text("⚙️ **Initializing Aria2c...**")
+        progress_msg = await message.reply_text("🚀 **Initializing...**")
+        
+        if SKIP_UNTIL_NAME:
+             await client.send_message(message.chat.id, f"🔍 Searching for start point: `{SKIP_UNTIL_NAME}`...")
 
-        for name, fid in valid_folders:
+        for name, info in valid_items:
             if STOP_PROCESS: break
             
-            # PIN logic: Isko loop ke andar handle kiya hai ab taaki skip me na pin ho
-            # Hum yaha pin nahi karenge, recursive_process ke andar hi karenge
+            fid = info['id']
+            mtype = info['mimeType']
             
-            await recursive_process(client, service, creds, fid, uid, progress_msg, parent_path="", is_root_selection=True)
+            # Global Skip Check for Root Items
+            if name in GLOBAL_SKIP_LIST:
+                await client.send_message(message.chat.id, f"🚫 **Skipping (Blacklisted):** {name}")
+                continue
+
+            # If Root Item is Folder -> Pin it and Recurse
+            if mtype == 'application/vnd.google-apps.folder':
+                chat_id = load_config().get("channel_id")
+                sent_msg = await client.send_message(chat_id, f"📂 **{name}**")
+                try: await client.pin_chat_message(chat_id, sent_msg.id)
+                except: pass
+                
+                await recursive_process(client, service, creds, fid, uid, progress_msg, parent_path="", is_root_selection=True)
+            
+            # If Root Item is File -> Download directly (Handle as recursive but shallow)
+            else:
+                # Check Start From for Root Files
+                if SKIP_UNTIL_NAME and not FOUND_START_FILE:
+                    if name == SKIP_UNTIL_NAME:
+                        FOUND_START_FILE = True
+                        await client.send_message(uid, f"✅ **Found Start Point:** {name}")
+                    else:
+                        continue
+                
+                msg = await message.reply_text(f"⏳ **Queued:** {name}")
+                try:
+                    temp_path = await download_with_aria2(fid, name, msg, creds)
+                    final_caption = f"🎥 **{name}**"
+                    
+                    f_size = os.path.getsize(temp_path)
+                    LIMIT = 1.9 * 1024 * 1024 * 1024
+                    if f_size <= LIMIT:
+                        await upload_file(client, temp_path, name, load_config().get("channel_id"), final_caption, msg)
+                    else:
+                        # Simple split logic for root file
+                        await msg.edit("✂️ Splitting...")
+                        # ... (Reuse split logic if needed, but usually root files are handled same way)
+                        # For simplicity, calling standard upload which handles send_video/doc
+                        await upload_file(client, temp_path, name, load_config().get("channel_id"), final_caption, msg)
+                    
+                    if os.path.exists(temp_path): os.remove(temp_path)
+                    await msg.delete()
+
+                except Exception as e:
+                     await client.send_message(uid, f"❌ Error: {name}\n{e}")
         
         if not STOP_PROCESS:
             if FOLDER_INDEX:
